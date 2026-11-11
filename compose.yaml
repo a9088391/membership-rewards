@@ -1,0 +1,55 @@
+name: membership-rewards
+
+services:
+  secrets:
+    image: node:24.22.2-bookworm-slim@sha256:01d566e8d94d8c619591d78652babfccd3c6992a3dffa9ed5ab39e11cf6c70e9
+    command: [node, /setup-secrets.mjs]
+    volumes:
+      - ./backend/setup-secrets.mjs:/setup-secrets.mjs:ro
+      - app-secrets:/run/membership-app
+      - db-secrets:/run/membership-db
+  db:
+    image: postgres:17.9-bookworm@sha256:47f917f7409eacd22fc5dfb1dee634e1b55cf0c01d1a7eb701be2227a03e0641
+    environment:
+      POSTGRES_DB: membership
+      POSTGRES_USER: membership
+      POSTGRES_PASSWORD_FILE: /run/membership-db/password
+    volumes:
+      - postgres:/var/lib/postgresql/data
+      - db-secrets:/run/membership-db:ro
+    depends_on:
+      secrets:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -U, membership, -d, membership]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+  app:
+    build:
+      context: .
+      target: application
+    environment:
+      APP_ORIGIN: http://membership-rewards.localhost:18441
+      PORT: 3000
+    ports:
+      - 127.0.0.1:18441:3000
+    volumes:
+      - app-secrets:/run/membership-app:ro
+      - db-secrets:/run/membership-db:ro
+    depends_on:
+      secrets:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, /bin/sh, /usr/local/bin/with-database, node, /workspace/backend/healthcheck.mjs]
+      interval: 3s
+      timeout: 3s
+      start_period: 30s
+      retries: 15
+
+volumes:
+  postgres:
+  app-secrets:
+  db-secrets:

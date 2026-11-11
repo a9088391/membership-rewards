@@ -1,0 +1,11 @@
+.git
+.scratch
+AGENTS.md
+**/.env*
+**/node_modules
+**/dist
+**/.next
+**/coverage
+**/*.tsbuildinfo
+backend/src/generated
+frontend/next-env.d.ts

@@ -1,0 +1,29 @@
+name: membership-rewards-test
+
+services:
+  app:
+    environment:
+      APP_ORIGIN: http://membership-rewards-test.localhost:18442
+    ports: !override
+      - 127.0.0.1:18442:3000
+  backend-checks:
+    build:
+      context: .
+      target: backend
+    environment:
+      APP_ORIGIN: http://membership-rewards-test.localhost:18442
+      MEMBERSHIP_TEST: ${COMPOSE_PROJECT_NAME}
+    volumes:
+      - app-secrets:/run/membership-app:ro
+      - db-secrets:/run/membership-db:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    command:
+      - sh
+      - -ec
+      - >-
+        test "$$MEMBERSHIP_TEST" = membership-rewards-test &&
+        npm --prefix backend run migrate:deploy &&
+        npm --prefix backend run seed &&
+        npm --prefix backend test -- --runInBand

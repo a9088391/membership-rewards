@@ -1,0 +1,47 @@
+generator client {
+  provider = "prisma-client"
+  output = "../src/generated"
+  importFileExtension = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  MEMBER
+  GROUP_ADMIN
+  BRAND_ADMIN
+}
+
+enum AttemptKind {
+  LOGIN_SOURCE
+  LOGIN_ACCOUNT
+  REGISTER_SOURCE
+}
+
+model Account {
+  id           String    @id @db.Uuid
+  username     String    @unique @db.VarChar(32)
+  passwordHash String
+  displayName  String
+  role         Role
+  memberNumber String?   @unique @db.Uuid
+  sessions     Session[]
+}
+
+model Session {
+  id        String    @id @db.Uuid
+  accountId String    @db.Uuid
+  account   Account   @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  expiresAt DateTime  @db.Timestamptz(3)
+  revokedAt DateTime? @db.Timestamptz(3)
+}
+
+model AttemptWindow {
+  kind      AttemptKind
+  key       String
+  attempted DateTime[]  @db.Timestamptz(3)
+
+  @@id([kind, key])
+}

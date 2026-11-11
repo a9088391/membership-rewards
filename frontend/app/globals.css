@@ -1,0 +1,153 @@
+:root {
+  color-scheme: light;
+  font-family: system-ui, sans-serif;
+  color: #162b29;
+  background: #f2f6f4;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.site-header {
+  padding: 1rem clamp(1rem, 4vw, 3rem);
+  border-bottom: 1px solid #d7e2dd;
+  background: #fff;
+  font-weight: 700;
+}
+
+main {
+  padding: clamp(2rem, 8vw, 5rem) 1rem;
+}
+
+.auth-card {
+  max-width: 30rem;
+  margin: 0 auto;
+  padding: clamp(1.25rem, 5vw, 2rem);
+  border: 1px solid #d7e2dd;
+  border-radius: 1rem;
+  background: #fff;
+  box-shadow: 0 1rem 2rem #162b2910;
+}
+
+h1 {
+  margin: 0 0 1.25rem;
+  font-size: clamp(1.5rem, 4vw, 2rem);
+  line-height: 1.25;
+}
+
+p {
+  margin: 0;
+}
+
+label {
+  display: block;
+  margin-bottom: 0.375rem;
+  font-weight: 600;
+}
+
+input, button {
+  min-height: 2.75rem;
+  padding: 0.625rem 0.75rem;
+  border: 1px solid transparent;
+  border-radius: 0.5rem;
+  font: inherit;
+}
+
+input {
+  width: 100%;
+  border-color: #7a8e87;
+  background: #fff;
+  color: inherit;
+}
+
+button {
+  width: 100%;
+  background: #075b4d;
+  color: #fff;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #064a3e;
+}
+
+button[aria-disabled='true'] {
+  background: #4a6b63;
+  cursor: wait;
+}
+
+:focus-visible {
+  outline: 3px solid #075b4d;
+  outline-offset: 3px;
+}
+
+.hint {
+  margin: 0.375rem 0 1rem;
+  color: #465c56;
+  font-size: 0.875rem;
+}
+
+.switch-mode {
+  margin-top: 0.625rem;
+  background: transparent;
+  color: #075b4d;
+}
+
+.switch-mode:hover, .switch-mode[aria-disabled='true'] {
+  background: #edf5f1;
+}
+
+form + [role='status'] {
+  margin-top: 0.625rem;
+}
+
+.notice {
+  margin-bottom: 1rem;
+  padding: 0.75rem;
+  border-radius: 0.5rem;
+  overflow-wrap: anywhere;
+}
+
+.notice p + p {
+  margin-top: 0.25rem;
+}
+
+.notice.status {
+  background: #e8f4ed;
+}
+
+.notice.alert {
+  color: #7c2320;
+  background: #fbecea;
+}
+
+.trace {
+  font-size: 0.8125rem;
+}
+
+.identity {
+  margin: 0 0 1.25rem;
+  overflow-wrap: anywhere;
+}
+
+.identity > div {
+  padding: 0.625rem 0;
+  border-bottom: 1px solid #d7e2dd;
+}
+
+.identity dt {
+  color: #465c56;
+  font-size: 0.875rem;
+}
+
+.identity dd {
+  margin: 0.25rem 0 0;
+  font-weight: 600;
+}
