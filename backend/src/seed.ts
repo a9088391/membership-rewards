@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { createDatabase } from './database.js';
 import { PointSource, Prisma, Role } from './generated/client.js';
 import { hashPassword } from './password.js';
-import { appendPointCredit, lockPointAccount } from './points.js';
+import { appendPointMovement, lockPointAccount } from './points.js';
 
 const accounts = [
   { username: 'demo_member', displayName: '示範會員', role: Role.MEMBER },
@@ -89,7 +89,7 @@ async function seed(): Promise<void> {
           where: { username: 'group_admin', role: Role.GROUP_ADMIN }, select: { id: true },
         });
         if (member.role !== Role.MEMBER) throw new Error('示範會員角色錯誤');
-        await appendPointCredit(tx, pointAccount, {
+        await appendPointMovement(tx, pointAccount, {
           actorId: admin.id, amount: 100, reason: '示範初始點數', source: PointSource.SEED,
         }, balance + 100);
       }

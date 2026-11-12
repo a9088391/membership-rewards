@@ -105,11 +105,7 @@ export function stopOffer(
     if (!resourceIdPattern.test(offerId)) throw missingResource();
     readBody(input, []);
     // 先鎖定所屬品牌的方案，再判斷是否已停發。並行請求讀取同一筆停發事實。
-    const [offer] = await tx.$queryRaw<Offer[]>`
-      SELECT "id", "name", "description", "points", "startsAt", "endsAt", "stoppedAt"
-      FROM "CouponOffer" WHERE "brandId" = ${id}::uuid AND "id" = ${offerId}::uuid FOR UPDATE
-    `;
-    if (!offer) throw missingResource();
+    const offer = await lockOffer(tx, id, offerId);
     if (offer.stoppedAt) return offerView(offer, offer.stoppedAt);
 
     const now = clock();
@@ -118,4 +114,13 @@ export function stopOffer(
     });
     return offerView(stopped, now);
   }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
+}
+
+export async function lockOffer(tx: Transaction, brandId: string, offerId: string) {
+  const [offer] = await tx.$queryRaw<Offer[]>`
+    SELECT "id", "name", "description", "points", "startsAt", "endsAt", "stoppedAt"
+    FROM "CouponOffer" WHERE "brandId" = ${brandId}::uuid AND "id" = ${offerId}::uuid FOR UPDATE
+  `;
+  if (!offer) throw missingResource();
+  return offer;
 }

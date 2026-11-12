@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type Dispatch, type FormEvent, type SetStateAction } from 'react';
-import { apiRequest, errorNotice, NoticeBox, type Notice } from './request';
+import { apiRequest, errorNotice, isResourceId, NoticeBox, type Notice } from './request';
 
 const maxPoints = 2147483647;
-const uuid = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 const ledgerTime = new Intl.DateTimeFormat('zh-TW', {
   timeZone: 'Asia/Taipei', dateStyle: 'medium', timeStyle: 'medium', hourCycle: 'h23',
 });
@@ -11,11 +10,9 @@ type Member = { memberNumber: string; displayName: string };
 type LedgerEntry = {
   id: string;
   amount: number;
-  reason: string;
-  source: 'SEED' | 'GRANT';
   createdAt: string;
   actorDisplayName: string;
-};
+} & ({ source: 'SEED' | 'GRANT'; reason: string } | { source: 'EXCHANGE'; reason: null });
 type Ledger = { balance: number; items: LedgerEntry[]; hasNext: boolean };
 type Grant = { key: string; points: number; reason: string };
 type GrantStorage = { key: string; pending: Grant | null };
@@ -36,8 +33,11 @@ function isBalance(value: unknown): value is number {
 
 function isLedgerEntry(value: unknown): value is LedgerEntry {
   const entry = object(value);
-  return !!entry && typeof entry.id === 'string' && isBalance(entry.amount) && entry.amount > 0
-    && typeof entry.reason === 'string' && (entry.source === 'SEED' || entry.source === 'GRANT')
+  return !!entry && typeof entry.id === 'string' && typeof entry.amount === 'number'
+    && (entry.source === 'EXCHANGE'
+      ? entry.amount < 0 && isBalance(-entry.amount) && entry.reason === null
+      : (entry.source === 'SEED' || entry.source === 'GRANT')
+        && entry.amount > 0 && isBalance(entry.amount) && typeof entry.reason === 'string')
     && typeof entry.createdAt === 'string' && Number.isFinite(Date.parse(entry.createdAt))
     && typeof entry.actorDisplayName === 'string';
 }
@@ -50,8 +50,7 @@ function isLedger(value: unknown): value is Ledger {
 
 function isGrantResult(value: unknown) {
   const result = object(value);
-  return !!result && typeof result.operationId === 'string' && uuid.test(result.operationId)
-    && typeof result.grantId === 'string' && uuid.test(result.grantId) && isBalance(result.balance);
+  return !!result && isResourceId(result.operationId) && isResourceId(result.grantId) && isBalance(result.balance);
 }
 
 function isReason(value: unknown): value is string {
@@ -64,7 +63,7 @@ function readPendingGrant(key: string): Grant | null {
   if (stored === null) return null;
 
   const pending = object(JSON.parse(stored));
-  if (!pending || typeof pending.key !== 'string' || !uuid.test(pending.key)
+  if (!pending || !isResourceId(pending.key)
       || !isBalance(pending.points) || pending.points === 0 || !isReason(pending.reason)) {
     throw new Error('無法讀取待確認加點紀錄。');
   }
@@ -167,8 +166,8 @@ function ActivePoints({ brand, isMember, actor, sessionInterrupted, onAccessDeni
     const result = await apiRequest(path, signal, { expectedActor: actor });
     if (!isCurrent(signal)) return;
     const target = object(result.body);
-    if (result.status !== 200 || !target || typeof target.memberNumber !== 'string'
-        || target.memberNumber !== memberNumber.toLowerCase() || !uuid.test(target.memberNumber)
+    if (result.status !== 200 || !target || !isResourceId(target.memberNumber)
+        || target.memberNumber !== memberNumber.toLowerCase()
         || typeof target.displayName !== 'string' || !isBalance(target.balance)) {
       const notice = errorNotice(result, '暫時無法查詢會員。');
       if (result.status === 401 || result.status === 403) {
@@ -207,7 +206,7 @@ function ActivePoints({ brand, isMember, actor, sessionInterrupted, onAccessDeni
   function lookup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (request.current || sessionInterrupted()) return;
-    if (!uuid.test(search)) {
+    if (!isResourceId(search)) {
       clearMember();
       setReadNotice({ kind: 'alert', message: '找不到此資源。請輸入完整會員編號。' });
       return;
@@ -378,8 +377,11 @@ function ActivePoints({ brand, isMember, actor, sessionInterrupted, onAccessDeni
                 <ol className="brand-list">
                   {ledger.data.items.map((entry) => (
                     <li key={entry.id}>
-                      <p><strong>+{entry.amount.toLocaleString('zh-TW')} 點</strong> {entry.source === 'SEED' ? '種子點數' : '加點'}</p>
-                      <p>原因 {entry.reason}</p>
+                      <p>
+                        <strong>{entry.amount.toLocaleString('zh-TW', { signDisplay: 'always' })} 點</strong>{' '}
+                        {{ SEED: '種子點數', GRANT: '加點', EXCHANGE: '兌換' }[entry.source]}
+                      </p>
+                      {entry.reason !== null && <p>原因 {entry.reason}</p>}
                       <p>操作者 {entry.actorDisplayName}</p>
                       <time dateTime={entry.createdAt}>{ledgerTime.format(new Date(entry.createdAt))}（Asia/Taipei）</time>
                     </li>

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
-import { apiRequest, errorNotice, NoticeBox, type Notice } from './request';
+import { useExchange } from './exchange';
+import { apiRequest, errorNotice, isResourceId, NoticeBox, type Notice } from './request';
 
 const statusLabels = {
   UPCOMING: '尚未開始',
@@ -39,7 +40,7 @@ function isTime(value: unknown): value is string {
 function isOffer(value: unknown): value is Offer {
   if (!value || typeof value !== 'object') return false;
   const { id, name, description, points, startsAt, endsAt, stoppedAt, status } = value as Partial<Offer>;
-  return typeof id === 'string' && typeof name === 'string' && typeof description === 'string'
+  return isResourceId(id) && typeof name === 'string' && typeof description === 'string'
     && typeof points === 'number' && Number.isInteger(points) && points > 0
     && isTime(startsAt) && isTime(endsAt) && (stoppedAt === null || isTime(stoppedAt))
     && typeof status === 'string' && Object.hasOwn(statusLabels, status);
@@ -59,10 +60,10 @@ type Access = {
 
 type Brand = { id: string; name: string };
 
-export function Offers({ brand, active, isMember, actor, sessionInterrupted, onAccessDenied, retainBrand }: Access & {
+export function Offers({ brand, active, memberNumber, actor, sessionInterrupted, onAccessDenied, retainBrand }: Access & {
   brand: Brand;
   active: boolean;
-  isMember: boolean;
+  memberNumber: string | null;
   retainBrand: (brand: Brand, retain: boolean) => void;
 }) {
   const [draft, setDraft] = useState(emptyDraft);
@@ -90,7 +91,7 @@ export function Offers({ brand, active, isMember, actor, sessionInterrupted, onA
   }, []);
 
   async function save(page: number, offer?: StopTarget) {
-    if (!active || isMember || feedback?.review || writeRequest.current || sessionInterrupted()) return;
+    if (!active || memberNumber || feedback?.review || writeRequest.current || sessionInterrupted()) return;
     const targetPage = offer ? page : 1;
     let input: Record<string, string | number> = {};
     if (!offer) {
@@ -159,7 +160,8 @@ export function Offers({ brand, active, isMember, actor, sessionInterrupted, onA
   return active ? (
     <section className="offers" id="brand-offers" aria-labelledby="offers-title">
       <h3 id="offers-title" ref={heading} tabIndex={-1}>{brand.name}的優惠券方案</h3>
-      <OfferList key={readStart.revision} readStart={readStart} path={path} actor={actor} isMember={isMember}
+      <OfferList key={readStart.revision} readStart={readStart} path={path} actor={actor}
+        brandId={brand.id} memberNumber={memberNumber} onAccessDenied={onAccessDenied}
         saving={saving} draft={draft} setDraft={setDraft} feedback={feedback}
         heading={heading} save={save} sessionInterrupted={sessionInterrupted}
         denyRead={denyRead} clearReadError={clearReadError}
@@ -172,20 +174,19 @@ export function Offers({ brand, active, isMember, actor, sessionInterrupted, onA
 }
 
 function OfferList({
-  readStart, path, actor, isMember, saving, draft, setDraft, feedback, heading, save,
-  sessionInterrupted, denyRead, clearReadError, acknowledge,
-}: {
+  readStart, path, actor, brandId, memberNumber, saving, draft, setDraft, feedback, heading, save,
+  sessionInterrupted, onAccessDenied, denyRead, clearReadError, acknowledge,
+}: Access & {
   readStart: ReadStart;
   path: string;
-  actor: string;
-  isMember: boolean;
+  brandId: string;
+  memberNumber: string | null;
   saving: boolean;
   draft: Draft;
   setDraft: (value: Draft) => void;
   feedback: Feedback | null;
   heading: { current: HTMLHeadingElement | null };
   save: (page: number, offer?: StopTarget) => Promise<void>;
-  sessionInterrupted: () => boolean;
   denyRead: (page: number, notice: Notice) => void;
   clearReadError: () => void;
   acknowledge: () => void;
@@ -198,8 +199,9 @@ function OfferList({
   const [checkedFirstPage, setCheckedFirstPage] = useState(false);
   const [loading, setLoading] = useState(autoRead);
   const request = useRef<AbortController | null>(null);
+  const exchange = useExchange({ actor, memberNumber, brandId, sessionInterrupted, onAccessDenied });
   const busy = loading || saving;
-  const canManage = !isMember && !!list;
+  const canManage = !memberNumber && !!list;
   const review = feedback?.review;
   const reviewedStop = review?.kind === 'stop' && list?.items.find(({ id }) => id === review.offer.id);
   const reviewed = review?.kind === 'create' ? checkedFirstPage : !!reviewedStop;
@@ -262,6 +264,13 @@ function OfferList({
     <>
       <p className="hint">方案時間以 Asia/Taipei 顯示。</p>
       {feedback && !saving && <NoticeBox notice={feedback.notice} />}
+      {exchange.notice && <NoticeBox notice={exchange.notice} />}
+      {exchange.sending && <p role="status">送出兌換中…</p>}
+      {exchange.pending && (
+        <button type="button" aria-disabled={exchange.sending} onClick={() => {
+          if (exchange.pending) void exchange.send(exchange.pending.offerId, exchange.pending);
+        }}>重試同一次兌換</button>
+      )}
       {readError && <NoticeBox notice={readError} />}
       <div className="brand-actions">
         <button type="button" aria-disabled={busy}
@@ -296,6 +305,13 @@ function OfferList({
                     <div><dt>開始時間</dt><dd><time dateTime={offer.startsAt}>{taipeiTime.format(new Date(offer.startsAt))}</time></dd></div>
                     <div><dt>截止時間</dt><dd><time dateTime={offer.endsAt}>{taipeiTime.format(new Date(offer.endsAt))}</time></dd></div>
                   </dl>
+                  {memberNumber && offer.status === 'ACTIVE' && (
+                    <button type="button" aria-disabled={busy || !exchange.canExchange}
+                      aria-label={`兌換：${offer.name}（${offer.points.toLocaleString('zh-TW')} 點，方案 ID ${offer.id}）`}
+                      onClick={() => {
+                        if (!busy && exchange.canExchange) void exchange.send(offer.id);
+                      }}>兌換</button>
+                  )}
                   {canManage && (
                     <>
                       <p className="brand-id">方案 ID {offer.id}</p>

@@ -57,7 +57,9 @@ model CouponOffer {
   stoppedAt   DateTime? @db.Timestamptz(3)
   createdAt   DateTime  @default(now()) @db.Timestamptz(3)
   brand       Brand     @relation(fields: [brandId], references: [id], onDelete: Restrict)
+  vouchers    Voucher[]
 
+  @@unique([brandId, id])
   @@index([brandId, createdAt, id])
 }
 
@@ -89,6 +91,7 @@ model AttemptWindow {
 enum PointSource {
   SEED
   GRANT
+  EXCHANGE
 }
 
 model PointAccount {
@@ -107,14 +110,35 @@ model PointLedger {
   brandId   String       @db.Uuid
   memberId  String       @db.Uuid
   amount    Int
-  reason    String       @db.VarChar(200)
+  reason    String?      @db.VarChar(200)
   source    PointSource
   actorId   String       @db.Uuid
   createdAt DateTime     @default(now()) @db.Timestamptz(3)
   account   PointAccount @relation(fields: [brandId, memberId], references: [brandId, memberId], onDelete: Restrict)
   actor     Account      @relation(fields: [actorId], references: [id], onDelete: Restrict)
 
+  exchangeId String?    @default(dbgenerated()) @db.Uuid
+  voucher    Voucher?   @relation("VoucherDebit")
+  requiredVoucher Voucher? @relation("RequiredVoucher", fields: [brandId, memberId, exchangeId], references: [brandId, memberId, ledgerId], onDelete: NoAction, onUpdate: NoAction)
+
+  @@unique([brandId, memberId, exchangeId])
   @@index([brandId, memberId, createdAt, id])
+}
+
+model Voucher {
+  id        String      @id @db.Uuid
+  code      String      @unique @db.Uuid
+  brandId   String      @db.Uuid
+  memberId  String      @db.Uuid
+  offerId   String      @db.Uuid
+  ledgerId  String      @db.Uuid
+  createdAt DateTime    @db.Timestamptz(3)
+  offer     CouponOffer @relation(fields: [brandId, offerId], references: [brandId, id], onDelete: Restrict)
+  ledger    PointLedger @relation("VoucherDebit", fields: [brandId, memberId, ledgerId], references: [brandId, memberId, exchangeId], onDelete: NoAction, onUpdate: NoAction)
+  requiredBy PointLedger? @relation("RequiredVoucher")
+
+  @@unique([brandId, memberId, ledgerId])
+  @@index([memberId, createdAt, id])
 }
 
 model IdempotentOperation {

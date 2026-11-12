@@ -31,6 +31,7 @@ import { createDatabase } from './database.js';
 import { Prisma, PrismaClient, Role } from './generated/client.js';
 import { createOffer, listOffers, stopOffer } from './offers.js';
 import { grantPoints, readPoints } from './points.js';
+import { exchangeOffer, readVouchers } from './vouchers.js';
 
 const appClock = Symbol('appClock');
 
@@ -176,11 +177,11 @@ class BrandController {
   }
 }
 
-function authenticateBrandRequest(auth: AuthService, request: Request, response: Response, brandId: string, lock = false) {
+function authenticateRequest(auth: AuthService, request: Request, response: Response, brandId?: unknown, lock = false) {
   return async (tx: Prisma.TransactionClient) => {
     const actor = await auth.me(readSession(request), tx, lock);
     response.locals.accountId = actor.accountId;
-    if (resourceIdPattern.test(brandId)) response.locals.brandId = brandId.toLowerCase();
+    if (typeof brandId === 'string' && resourceIdPattern.test(brandId)) response.locals.brandId = brandId.toLowerCase();
     // 以 Cookie 查得的身分為準，防止其他分頁已切換帳號時讀寫舊畫面的資料。
     const expectedActor = request.header('X-Membership-Actor');
     if (expectedActor !== undefined && expectedActor !== actor.identity.username) {
@@ -200,7 +201,7 @@ class PointsController {
     @Req() request: Request,
     @Res({ passthrough: true }) response: Response,
   ) {
-    return readPoints(this.db, authenticateBrandRequest(this.auth, request, response, brandId), { brandId });
+    return readPoints(this.db, authenticateRequest(this.auth, request, response, brandId), { brandId });
   }
 
   @Get('me/ledger')
@@ -211,7 +212,7 @@ class PointsController {
     @Req() request: Request,
     @Res({ passthrough: true }) response: Response,
   ) {
-    return readPoints(this.db, authenticateBrandRequest(this.auth, request, response, brandId), { brandId }, () => readPage(page, pageSize));
+    return readPoints(this.db, authenticateRequest(this.auth, request, response, brandId), { brandId }, () => readPage(page, pageSize));
   }
 
   @Get('members/:memberNumber')
@@ -221,7 +222,7 @@ class PointsController {
     @Req() request: Request,
     @Res({ passthrough: true }) response: Response,
   ) {
-    return readPoints(this.db, authenticateBrandRequest(this.auth, request, response, brandId), { brandId, memberNumber });
+    return readPoints(this.db, authenticateRequest(this.auth, request, response, brandId), { brandId, memberNumber });
   }
 
   @Get('members/:memberNumber/ledger')
@@ -234,7 +235,7 @@ class PointsController {
     @Res({ passthrough: true }) response: Response,
   ) {
     return readPoints(
-      this.db, authenticateBrandRequest(this.auth, request, response, brandId), { brandId, memberNumber }, () => readPage(page, pageSize),
+      this.db, authenticateRequest(this.auth, request, response, brandId), { brandId, memberNumber }, () => readPage(page, pageSize),
     );
   }
 
@@ -246,7 +247,7 @@ class PointsController {
     @Req() request: Request,
     @Res({ passthrough: true }) response: Response,
   ) {
-    const authenticate = authenticateBrandRequest(this.auth, request, response, brandId, true);
+    const authenticate = authenticateRequest(this.auth, request, response, brandId, true);
     return auditWrite(response, 'grantPoints', 201, () => grantPoints(
       this.db, authenticate, { brandId, memberNumber }, request.header('Idempotency-Key'), body,
     ));
@@ -269,7 +270,7 @@ class OffersController {
     @Req() request: Request,
     @Res({ passthrough: true }) response: Response,
   ) {
-    const authenticate = authenticateBrandRequest(this.auth, request, response, brandId);
+    const authenticate = authenticateRequest(this.auth, request, response, brandId);
     return listOffers(this.db, authenticate, brandId, () => readPage(page, pageSize), this.clock);
   }
 
@@ -280,11 +281,29 @@ class OffersController {
     @Req() request: Request,
     @Res({ passthrough: true }) response: Response,
   ) {
-    const authenticate = authenticateBrandRequest(this.auth, request, response, brandId, true);
+    const authenticate = authenticateRequest(this.auth, request, response, brandId, true);
     return auditWrite(response, 'createOffer', 201, async () => {
       const offer = await createOffer(this.db, authenticate, brandId, body, this.clock);
       response.locals.offerId = offer.id;
       return offer;
+    });
+  }
+
+  @Post(':offerId/exchanges')
+  exchange(
+    @Param('brandId') brandId: string,
+    @Param('offerId') offerId: string,
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const authenticate = authenticateRequest(this.auth, request, response, brandId, true);
+    return auditWrite(response, 'exchangeOffer', 201, async () => {
+      const result = await exchangeOffer(
+        this.db, authenticate, { brandId, offerId }, request.header('Idempotency-Key'), body, this.clock,
+      );
+      response.locals.offerId = offerId.toLowerCase();
+      return result;
     });
   }
 
@@ -297,7 +316,7 @@ class OffersController {
     @Req() request: Request,
     @Res({ passthrough: true }) response: Response,
   ) {
-    const authenticate = authenticateBrandRequest(this.auth, request, response, brandId, true);
+    const authenticate = authenticateRequest(this.auth, request, response, brandId, true);
     return auditWrite(response, 'stopOffer', 200, async () => {
       const offer = await stopOffer(this.db, authenticate, brandId, offerId, body, this.clock);
       response.locals.offerId = offer.id;
@@ -306,12 +325,46 @@ class OffersController {
   }
 }
 
+@Controller('api')
+class VouchersController {
+  constructor(
+    private readonly auth: AuthService,
+    private readonly db: PrismaClient,
+    @Inject(appClock) private readonly clock: () => Date,
+  ) {}
+
+  @Get('me/vouchers')
+  myVouchers(
+    @Query('brandId') brandId: unknown,
+    @Query('page') page: unknown,
+    @Query('pageSize') pageSize: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const authenticate = authenticateRequest(this.auth, request, response, brandId);
+    return readVouchers(this.db, authenticate, { brandId }, () => readPage(page, pageSize), this.clock);
+  }
+
+  @Get('brands/:brandId/members/:memberNumber/vouchers')
+  memberVouchers(
+    @Param('brandId') brandId: string,
+    @Param('memberNumber') memberNumber: string,
+    @Query('page') page: unknown,
+    @Query('pageSize') pageSize: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const authenticate = authenticateRequest(this.auth, request, response, brandId);
+    return readVouchers(this.db, authenticate, { brandId, memberNumber }, () => readPage(page, pageSize), this.clock);
+  }
+}
+
 @Module({})
 class ApiModule {
   static withServices(auth: AuthService, db: PrismaClient, clock: () => Date): DynamicModule {
     return {
       module: ApiModule,
-      controllers: [AuthController, BrandController, PointsController, OffersController],
+      controllers: [AuthController, BrandController, PointsController, OffersController, VouchersController],
       providers: [
         { provide: AuthService, useValue: auth }, { provide: PrismaClient, useValue: db }, { provide: appClock, useValue: clock },
       ],
@@ -347,6 +400,13 @@ class ErrorFilter implements ExceptionFilter {
 
 const jsonOptions = { limit: 16 * 1024, inflate: false };
 const parseJson = express.json(jsonOptions);
+const parseExchangeJson = express.json({
+  ...jsonOptions,
+  verify(_request, _response, body) {
+    // Express 會把零位元組的 JSON 解析成 {}，兌換仍要求明確送出空物件。
+    if (body.length === 0) throw invalidInput();
+  },
+});
 const parsePointsJson = express.json({
   ...jsonOptions,
   reviver(key: string, value: unknown, context?: { source: string }) {
@@ -373,6 +433,8 @@ const operations = new Map([
   ['GET /api/brands', 'listBrands'],
   ['HEAD /api/brands', 'listBrands'],
   ['POST /api/brands', 'createBrand'],
+  ['GET /api/me/vouchers', 'myVouchers'],
+  ['HEAD /api/me/vouchers', 'myVouchers'],
 ]);
 
 const brandOperations: [string[], RegExp, string][] = [
@@ -381,10 +443,12 @@ const brandOperations: [string[], RegExp, string][] = [
   [['GET', 'HEAD'], /^\/api\/brands\/[^/]+\/me\/ledger$/, 'myLedger'],
   [['GET', 'HEAD'], /^\/api\/brands\/[^/]+\/members\/[^/]+$/, 'memberPoints'],
   [['GET', 'HEAD'], /^\/api\/brands\/[^/]+\/members\/[^/]+\/ledger$/, 'memberLedger'],
+  [['GET', 'HEAD'], /^\/api\/brands\/[^/]+\/members\/[^/]+\/vouchers$/, 'memberVouchers'],
   [['POST'], /^\/api\/brands\/[^/]+\/members\/[^/]+\/grants$/, 'grantPoints'],
   [['GET', 'HEAD'], /^\/api\/brands\/[^/]+\/offers$/, 'listOffers'],
   [['POST'], /^\/api\/brands\/[^/]+\/offers$/, 'createOffer'],
   [['POST'], /^\/api\/brands\/[^/]+\/offers\/[^/]+\/stop$/, 'stopOffer'],
+  [['POST'], /^\/api\/brands\/[^/]+\/offers\/[^/]+\/exchanges$/, 'exchangeOffer'],
 ];
 
 function logApiOutcome(response: Response, operation: string, status: number) {
@@ -477,7 +541,8 @@ export async function createApp(options: AppOptions = {}) {
         await options.frontend(request, response);
         return;
       }
-      const parseBody = operation === 'grantPoints' || operation === 'createOffer' ? parsePointsJson : parseJson;
+      const parseBody = operation === 'grantPoints' || operation === 'createOffer' ? parsePointsJson
+        : operation === 'exchangeOffer' ? parseExchangeJson : parseJson;
       parseBody(request, response, (error) => {
         if (error) respondError(response, invalidInput());
         else next();

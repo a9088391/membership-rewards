@@ -6,7 +6,11 @@ export type Notice = {
   retryAfterSeconds?: number;
 };
 
-export type ApiResult = { status: number; body: unknown; sessionTag?: string };
+export type ApiResult = { status: number; body: unknown; sessionTag?: string; serverTime?: number };
+
+export function isResourceId(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value);
+}
 
 export function errorNotice({ body }: ApiResult, fallback: string): Notice {
   if (body && typeof body === 'object') {
@@ -53,9 +57,12 @@ export async function apiRequest(
     const body: unknown = response.status === 204 ? null : await response.json().catch(() => null);
     const sessionTag = response.status === 200 && (path === 'auth/login' || path === 'auth/me')
       ? response.headers.get('X-Membership-Session') : null;
+    const responseDate = response.headers.get('Date');
+    const serverTime = responseDate ? Date.parse(responseDate) : NaN;
     return {
       status: response.status, body,
       ...(sessionTag && /^[A-Za-z0-9_-]{43}$/.test(sessionTag) && { sessionTag }),
+      ...(Number.isFinite(serverTime) && new Date(serverTime).toUTCString() === responseDate && { serverTime }),
     };
   } catch {
     return { status: 0, body: null };

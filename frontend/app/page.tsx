@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { Offers } from './offers';
 import { Points } from './points';
 import { apiRequest, errorNotice, NoticeBox, type ApiResult, type Notice } from './request';
+import { Vouchers } from './vouchers';
 
 const roles = {
   MEMBER: '會員',
@@ -48,6 +49,7 @@ function confirmedSession({ status, body, sessionTag }: ApiResult): ConfirmedSes
 
 type Brand = { id: string; name: string };
 type BrandPage = { items: Brand[]; hasNext: boolean };
+type PanelKind = 'points' | 'offers' | 'vouchers';
 
 function isBrand(value: unknown): value is Brand {
   return !!value && typeof value === 'object'
@@ -68,9 +70,9 @@ function Brands({ identity, active, onAccessDenied, sessionInterrupted }: {
   sessionInterrupted: () => boolean;
 }) {
   const [page, setPage] = useState(1);
-  const [panel, setPanel] = useState<{ kind: 'points' | 'offers'; brandId: string } | null>(null);
+  const [panel, setPanel] = useState<{ kind: PanelKind; brandId: string } | null>(null);
   const [retainedOfferBrands, setRetainedOfferBrands] = useState<Brand[]>([]);
-  const [pointsDenial, setPointsDenial] = useState<Notice | null>(null);
+  const [panelDenial, setPanelDenial] = useState<Notice | null>(null);
   const [list, setList] = useState<BrandPage | null>(null);
   const [activity, setActivity] = useState<'loading' | 'saving' | null>('loading');
   const [listFailure, setListFailure] = useState<{ page: number; notice: Notice } | null>(null);
@@ -92,9 +94,9 @@ function Brands({ identity, active, onAccessDenied, sessionInterrupted }: {
     setRetainedOfferBrands((previous) => retain ? [...previous, brand] : previous.filter(({ id }) => id !== brand.id));
   }
 
-  const denyPointsAccess = useCallback((notice: Notice) => {
+  const denyPanelAccess = useCallback((notice: Notice) => {
     setPanel(null);
-    setPointsDenial(notice);
+    setPanelDenial(notice);
     onAccessDenied();
   }, [onAccessDenied]);
   const writeLocked = activity !== null || !!writeNotice?.review;
@@ -150,9 +152,9 @@ function Brands({ identity, active, onAccessDenied, sessionInterrupted }: {
     });
   }
 
-  function togglePanel(kind: 'points' | 'offers', brandId: string) {
+  function togglePanel(kind: PanelKind, brandId: string) {
     if (!active || sessionInterrupted()) return;
-    setPointsDenial(null);
+    setPanelDenial(null);
     setPanel((current) => current?.kind === kind && current.brandId === brandId ? null : { kind, brandId });
   }
 
@@ -256,6 +258,10 @@ function Brands({ identity, active, onAccessDenied, sessionInterrupted }: {
                   aria-expanded={panel?.kind === 'offers' && panel.brandId === brand.id}
                   aria-controls={panel?.kind === 'offers' && panel.brandId === brand.id ? 'brand-offers' : undefined}
                   onClick={() => togglePanel('offers', brand.id)}>查看優惠券方案</button>
+                <button type="button" aria-label={`查看持有券：${brand.name}（品牌 ID ${brand.id}）`}
+                  aria-expanded={panel?.kind === 'vouchers' && panel.brandId === brand.id}
+                  aria-controls={panel?.kind === 'vouchers' && panel.brandId === brand.id ? 'brand-vouchers' : undefined}
+                  onClick={() => togglePanel('vouchers', brand.id)}>查看持有券</button>
                 {canWrite && (
                   <button type="button" aria-label={`改名：${brand.name}（品牌 ID ${brand.id}）`}
                     aria-disabled={writeLocked || !!edit} onClick={() => {
@@ -298,17 +304,21 @@ function Brands({ identity, active, onAccessDenied, sessionInterrupted }: {
           </div>
         </form>
       )}
-      {pointsDenial && <NoticeBox notice={pointsDenial} />}
+      {panelDenial && <NoticeBox notice={panelDenial} />}
       {selectedBrand && panel?.kind === 'points' && (
         <Points key={selectedBrand.id} brand={selectedBrand} active={active} isMember={identity.role === 'MEMBER'}
           actor={identity.username} sessionInterrupted={sessionInterrupted}
-          onAccessDenied={denyPointsAccess} />
+          onAccessDenied={denyPanelAccess} />
       )}
       {offerBrands.map((brand) => (
         <Offers key={brand.id} brand={brand} active={active && brand.id === selectedOfferBrand?.id}
-          isMember={identity.role === 'MEMBER'} actor={identity.username} sessionInterrupted={sessionInterrupted}
+          memberNumber={identity.memberNumber} actor={identity.username} sessionInterrupted={sessionInterrupted}
           onAccessDenied={onAccessDenied} retainBrand={retainOfferBrand} />
       ))}
+      {active && selectedBrand && panel?.kind === 'vouchers' && (
+        <Vouchers key={selectedBrand.id} brand={selectedBrand} isMember={identity.role === 'MEMBER'}
+          actor={identity.username} sessionInterrupted={sessionInterrupted} onAccessDenied={denyPanelAccess} />
+      )}
     </section>
   );
 }

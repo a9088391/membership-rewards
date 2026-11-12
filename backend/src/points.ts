@@ -1,7 +1,8 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { ApiError, invalidInput, readBody } from './auth.js';
+import { randomUUID } from 'node:crypto';
+import { invalidInput, readBody } from './auth.js';
 import { forbidden, missingResource, requireBrand, resourceIdPattern } from './brand-access.js';
 import { PointSource, Prisma, Role, type PrismaClient } from './generated/client.js';
+import { readOperationKey, runIdempotent } from './idempotency.js';
 
 const maxBalance = 2147483647;
 
@@ -19,7 +20,7 @@ type Authenticate = (tx: Transaction) => Promise<PointActor>;
 type PointTarget = { brandId: string; memberNumber?: string };
 type Page = { skip: number; pageSize: number };
 
-async function pointSubject(tx: Transaction, actor: PointActor, target: PointTarget, lock = false) {
+export async function pointSubject(tx: Transaction, actor: PointActor, target: PointTarget, lock = false) {
   const own = target.memberNumber === undefined;
   const { role, memberNumber, displayName } = actor.identity;
   if (own ? role !== Role.MEMBER : role === Role.MEMBER) throw forbidden();
@@ -76,103 +77,64 @@ export async function lockPointAccount(tx: Transaction, { brandId, memberId }: P
     VALUES (${brandId}::uuid, ${memberId}::uuid)
     ON CONFLICT ("brandId", "memberId") DO NOTHING
   `;
+  const balance = await findLockedPointBalance(tx, { brandId, memberId });
+  if (balance === null) throw new Error('建立後找不到品牌點數帳戶');
+  return balance;
+}
+
+export async function findLockedPointBalance(tx: Transaction, { brandId, memberId }: PointAccount) {
   const [account] = await tx.$queryRaw<{ balance: number }[]>`
     SELECT "balance" FROM "PointAccount"
     WHERE "brandId" = ${brandId}::uuid AND "memberId" = ${memberId}::uuid FOR UPDATE
   `;
-  return account.balance;
+  return account?.balance ?? null;
 }
 
-export async function appendPointCredit(
+export async function appendPointMovement(
   tx: Transaction,
   account: PointAccount,
-  credit: { actorId: string; amount: number; reason: string; source: PointSource },
+  movement: { actorId: string; amount: number; reason: string | null; source: PointSource },
   balance: number,
+  createdAt = new Date(),
 ) {
   await tx.pointAccount.update({ where: { brandId_memberId: account }, data: { balance } });
   return tx.pointLedger.create({
-    data: { ...account, ...credit, id: randomUUID(), createdAt: new Date() }, select: { id: true },
+    data: { ...account, ...movement, id: randomUUID(), createdAt }, select: { id: true },
   });
 }
 
 function readGrant(key: string | undefined, body: unknown) {
-  if (key === undefined || !resourceIdPattern.test(key)) throw invalidInput();
+  const operationKey = readOperationKey(key);
   const { points, reason } = readBody(body, ['points', 'reason']);
   if (!isPositivePoints(points) || typeof reason !== 'string' || !reason.isWellFormed()) throw invalidInput();
   const normalized = reason.trim();
   if (normalized.length === 0 || [...normalized].length > 200 || /\p{Cc}/u.test(normalized)) throw invalidInput();
-  return { key: key.toLowerCase(), points, reason: normalized };
+  return { key: operationKey, points, reason: normalized };
 }
 
 const balanceLimit = { code: 'BALANCE_LIMIT_EXCEEDED', message: '加點後的餘額會超過上限。' };
-const temporaryGrantError = () => new ApiError(
-  503, 'SERVICE_UNAVAILABLE', '加點結果尚未確認，請使用相同的操作識別碼重試。',
-);
-
-function rolledBackByContention(error: unknown) {
-  return error instanceof Prisma.PrismaClientKnownRequestError && (
-    error.code === 'P2034'
-    || (error.code === 'P2010' && (error.meta?.code === '40001' || error.meta?.code === '40P01'))
-  );
-}
-
-export async function grantPoints(
+export function grantPoints(
   db: PrismaClient,
   authenticate: Authenticate,
   target: PointTarget & { memberNumber: string },
   keyInput: string | undefined,
   body: unknown,
 ) {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      const outcome = await db.$transaction(async (tx) => {
-        const actor = await authenticate(tx);
-        const { account } = await pointSubject(tx, actor, target, true);
-        const { key, points, reason } = readGrant(keyInput, body);
-        const { accountId: actorId } = actor;
-        const fingerprint = createHash('sha256')
-          .update(JSON.stringify(['GRANT', account.brandId, account.memberId, points, reason])).digest('hex');
-        const operationId = randomUUID();
-        // 授權與格式檢查完成後先取得冪等唯一鍵，再取得帳戶鎖。
-        const inserted = await tx.$executeRaw`
-          INSERT INTO "IdempotentOperation" ("id", "actorId", "key", "fingerprint")
-          VALUES (${operationId}::uuid, ${actorId}::uuid, ${key}::uuid, ${fingerprint})
-          ON CONFLICT ("actorId", "key") DO NOTHING
-        `;
-        if (!inserted) {
-          const prior = await tx.idempotentOperation.findUniqueOrThrow({ where: { actorId_key: { actorId, key } } });
-          if (prior.fingerprint !== fingerprint) {
-            throw new ApiError(409, 'IDEMPOTENCY_CONFLICT', '此操作識別碼已用於不同的內容。');
-          }
-          return prior;
-        }
-
+  return runIdempotent(db, '加點', async (tx) => {
+    const actor = await authenticate(tx);
+    const { account } = await pointSubject(tx, actor, target, true);
+    const { key, points, reason } = readGrant(keyInput, body);
+    const { accountId: actorId } = actor;
+    return {
+      actorId, key, content: ['GRANT', account.brandId, account.memberId, points, reason],
+      async execute(operationId) {
         const balance = await lockPointAccount(tx, account) + points;
-        if (balance > maxBalance) {
-          return tx.idempotentOperation.update({
-            where: { id: operationId }, data: { status: 409, result: balanceLimit },
-          });
-        }
-        const { id: grantId } = await appendPointCredit(
+        if (balance > maxBalance) return { status: 409, result: balanceLimit };
+        const { id: grantId } = await appendPointMovement(
           tx, account, { actorId, amount: points, reason, source: PointSource.GRANT }, balance,
         );
-        return tx.idempotentOperation.update({
-          where: { id: operationId }, data: { status: 201, result: { operationId, grantId, balance } },
-        });
-      }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
-
-      // 業務拒絕須提交後再交給 HTTP 錯誤處理，重送回放原錯誤與新追蹤識別。
-      const { status, result } = outcome;
-      if (status === 201 && result) return result;
-      if (status !== null && result && typeof result === 'object' && !Array.isArray(result)
-          && typeof result.code === 'string' && typeof result.message === 'string') {
-        throw new ApiError(status, result.code, result.message);
-      }
-      throw temporaryGrantError();
-    } catch (error) {
-      if (error instanceof ApiError) throw error;
-      // 只有資料庫已確認整筆回滾的競爭錯誤可由伺服器有限重試。
-      if (attempt >= 2 || !rolledBackByContention(error)) throw temporaryGrantError();
-    }
-  }
+        return { status: 201, result: { operationId, grantId, balance } };
+      },
+    };
+  });
 }
