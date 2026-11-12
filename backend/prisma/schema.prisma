@@ -28,6 +28,26 @@ model Account {
   role         Role
   memberNumber String?   @unique @db.Uuid
   sessions     Session[]
+  brandGrants  BrandAdminGrant[]
+}
+
+model Brand {
+  id        String            @id @db.Uuid
+  name      String            @db.VarChar(80)
+  seedKey   String?           @unique
+  createdAt DateTime          @default(now()) @db.Timestamptz(3)
+  grants    BrandAdminGrant[]
+
+  @@index([createdAt, id])
+}
+
+model BrandAdminGrant {
+  accountId String  @db.Uuid
+  brandId   String  @db.Uuid
+  account   Account @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  brand     Brand   @relation(fields: [brandId], references: [id], onDelete: Restrict)
+
+  @@id([accountId, brandId])
 }
 
 model Session {

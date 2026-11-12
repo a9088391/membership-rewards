@@ -1,6 +1,6 @@
 # 多品牌會員、點數與優惠券管理平台
 
-目前可公開註冊會員，以會員、集團管理員或品牌管理員登入，查看目前身分並登出。NestJS API 與 Next.js 介面共用同一個本機 HTTP 入口。Prisma 在 PostgreSQL 保存帳號、工作階段及限流狀態。
+目前可公開註冊會員，以會員、集團管理員或品牌管理員登入，查看目前身分與品牌清單。集團管理員可新增品牌和改名，改名後沿用原品牌識別。NestJS API 與 Next.js 介面共用同一個本機 HTTP 入口。Prisma 在 PostgreSQL 保存帳號、工作階段、限流狀態、品牌及品牌授權。
 
 ## 本機啟動
 
@@ -18,18 +18,19 @@ docker compose up -d --build --wait
 docker compose exec app cat /run/membership-app/demo-passwords.json
 ```
 
-| 帳號 | 角色 |
-| --- | --- |
-| `demo_member` | 會員 |
-| `group_admin` | 集團管理員 |
-| `brand_admin_a` | 品牌管理員 |
-| `brand_admin_b` | 品牌管理員 |
+| 帳號 | 角色 | 管理品牌範圍 |
+| --- | --- | --- |
+| `demo_member` | 會員 | — |
+| `group_admin` | 集團管理員 | 全部品牌，含新增品牌 |
+| `brand_admin_a` | 品牌管理員 | 預載咖啡品牌 |
+| `brand_admin_b` | 品牌管理員 | 預載餐飲品牌 |
 
 1. 選擇「註冊」，輸入帳號、密碼及顯示名稱，再用新帳號登入。畫面會顯示角色與伺服器分配的會員編號。
 2. 重新整理頁面確認目前身分。登入工作階段固定 30 分鐘。
-3. 登出，再用任一示範管理員登入。畫面會更新為該帳號的角色。
+3. 在品牌清單查看咖啡和餐飲品牌。登出後以 `group_admin` 登入，在同一區塊新增品牌，或選擇既有品牌旁的「改名」後儲存。若品牌同名，可比對清單上的品牌 ID。名稱去除首尾空白後須為 1 至 80 個字元，且不得含控制字元。
+4. 登出後以品牌管理員登入，確認仍能查看品牌清單，且畫面只提供瀏覽操作。
 
-停止服務時，以下指令會保留 PostgreSQL 與密鑰資料卷。再次執行啟動指令會沿用既有資料與示範密碼。
+停止服務時，以下指令會保留 PostgreSQL 與密鑰資料卷。再次執行啟動指令會沿用既有資料與示範密碼，包含新建品牌、修改後的品牌名稱及既有授權。
 
 ```sh
 docker compose down
@@ -39,7 +40,7 @@ docker compose down
 
 ## 隔離驗收
 
-測試需要 Docker Compose 2.24.4 或以上。以下指令在獨立的 `membership-rewards-test` 專案套用遷移、初始化帳號，並執行 Jest／Supertest 和真實 PostgreSQL 整合測試。
+測試需要 Docker Compose 2.24.4 或以上。以下指令在獨立的 `membership-rewards-test` 專案套用遷移、初始化帳號、品牌及授權，並執行 Jest／Supertest 和真實 PostgreSQL 整合測試。
 
 ```sh
 docker compose -p membership-rewards-test -f compose.yaml -f compose.test.yaml run --build --rm backend-checks

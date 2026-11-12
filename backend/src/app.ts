@@ -2,6 +2,7 @@ import 'reflect-metadata';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import {
+  BadRequestException,
   Body,
   Catch,
   Controller,
@@ -9,7 +10,11 @@ import {
   HttpCode,
   HttpException,
   Module,
+  NotFoundException,
+  Param,
+  Patch,
   Post,
+  Query,
   Req,
   Res,
   type ArgumentsHost,
@@ -19,8 +24,9 @@ import {
 import { NestFactory } from '@nestjs/core';
 import { ExpressAdapter, type NestExpressApplication } from '@nestjs/platform-express';
 import express, { type Request, type Response } from 'express';
-import { ApiError, AuthService, invalidInput, sessionCookie, sessionCookieOptions } from './auth.js';
+import { ApiError, AuthService, invalidInput, readBody, sessionCookie, sessionCookieOptions } from './auth.js';
 import { createDatabase } from './database.js';
+import { Prisma, PrismaClient, Role } from './generated/client.js';
 
 type AppOptions = {
   frontend?: (request: Request, response: Response) => Promise<unknown>;
@@ -67,13 +73,98 @@ class AuthController {
   }
 }
 
+const brandFields = { id: true, name: true } as const;
+const brandIdPattern = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
+
+function readBrandName(input: unknown) {
+  const { name } = readBody(input, ['name']);
+  if (typeof name !== 'string' || !name.isWellFormed()) throw invalidInput();
+  const trimmed = name.trim();
+  if (trimmed.length === 0 || [...trimmed].length > 80 || /\p{Cc}/u.test(trimmed)) throw invalidInput();
+  return trimmed;
+}
+
+function positiveInteger(value: unknown, fallback: number) {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) throw invalidInput();
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw invalidInput();
+  return parsed;
+}
+
+@Controller('api/brands')
+class BrandController {
+  constructor(private readonly auth: AuthService, private readonly db: PrismaClient) {}
+
+  private async requireGroupAdmin(request: Request, response: Response) {
+    const { accountId, identity } = await this.auth.me(readSession(request));
+    response.locals.accountId = accountId;
+    if (identity.role !== Role.GROUP_ADMIN) throw new ApiError(403, 'FORBIDDEN', '沒有權限執行此操作。');
+  }
+
+  @Get()
+  async list(
+    @Query('page') pageInput: unknown,
+    @Query('pageSize') pageSizeInput: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const { accountId } = await this.auth.me(readSession(request));
+    response.locals.accountId = accountId;
+    const page = positiveInteger(pageInput, 1);
+    const pageSize = positiveInteger(pageSizeInput, 20);
+    const skip = (page - 1) * pageSize;
+    if (pageSize > 100 || !Number.isSafeInteger(skip)) throw invalidInput();
+    const items = await this.db.brand.findMany({
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      skip,
+      take: pageSize + 1,
+      select: brandFields,
+    });
+    return { items: items.slice(0, pageSize), hasNext: items.length > pageSize };
+  }
+
+  @Post()
+  async create(@Body() body: unknown, @Req() request: Request, @Res({ passthrough: true }) response: Response) {
+    await this.requireGroupAdmin(request, response);
+    const brand = await this.db.brand.create({
+      data: { id: randomUUID(), name: readBrandName(body) },
+      select: brandFields,
+    });
+    response.locals.brandId = brand.id;
+    return brand;
+  }
+
+  @Patch(':brandId')
+  async rename(
+    @Param('brandId') id: string,
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    await this.requireGroupAdmin(request, response);
+    if (!brandIdPattern.test(id)) throw invalidInput();
+    const name = readBrandName(body);
+    try {
+      const brand = await this.db.brand.update({ where: { id }, data: { name }, select: brandFields });
+      response.locals.brandId = brand.id;
+      return brand;
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') {
+        throw new NotFoundException();
+      }
+      throw error;
+    }
+  }
+}
+
 @Module({})
-class AuthModule {
-  static withService(auth: AuthService): DynamicModule {
+class ApiModule {
+  static withServices(auth: AuthService, db: PrismaClient): DynamicModule {
     return {
-      module: AuthModule,
-      controllers: [AuthController],
-      providers: [{ provide: AuthService, useValue: auth }],
+      module: ApiModule,
+      controllers: [AuthController, BrandController],
+      providers: [{ provide: AuthService, useValue: auth }, { provide: PrismaClient, useValue: db }],
     };
   }
 }
@@ -87,9 +178,11 @@ function respondError(response: Response, error: unknown) {
 
   const failure = error instanceof ApiError
     ? error
-    : error instanceof HttpException && error.getStatus() === 404
-      ? new ApiError(404, 'NOT_FOUND', '找不到此資源。')
-      : new ApiError(503, 'SERVICE_UNAVAILABLE', '服務暫時無法使用，請稍後再試。');
+    : error instanceof BadRequestException
+      ? invalidInput()
+      : error instanceof HttpException && error.getStatus() === 404
+        ? new ApiError(404, 'NOT_FOUND', '找不到此資源。')
+        : new ApiError(503, 'SERVICE_UNAVAILABLE', '服務暫時無法使用，請稍後再試。');
   const { status, code, message, retryAfterSeconds } = failure;
   if (retryAfterSeconds !== undefined) response.setHeader('Retry-After', retryAfterSeconds);
   response.status(status).json({ code, message, traceId: response.locals.traceId, retryAfterSeconds });
@@ -109,6 +202,9 @@ const operations = new Map([
   ['GET /api/auth/me', 'me'],
   ['HEAD /api/auth/me', 'me'],
   ['POST /api/auth/logout', 'logout'],
+  ['GET /api/brands', 'listBrands'],
+  ['HEAD /api/brands', 'listBrands'],
+  ['POST /api/brands', 'createBrand'],
 ]);
 
 async function readConfig() {
@@ -130,7 +226,8 @@ async function readConfig() {
 
 export async function createApp(options: AppOptions = {}) {
   const { origin, host, key } = await readConfig();
-  const auth = new AuthService(createDatabase(), key, options.clock ?? (() => new Date()));
+  const db = createDatabase();
+  const auth = new AuthService(db, key, options.clock ?? (() => new Date()));
   const server = express();
   server.disable('x-powered-by');
   server.disable('etag');
@@ -140,13 +237,14 @@ export async function createApp(options: AppOptions = {}) {
 
   server.use(async (request, response, next) => {
     const api = request.path === '/api' || request.path.startsWith('/api/');
-    const operation = operations.get(request.method + ' ' + request.path) ?? 'unknown';
+    const operation = operations.get(request.method + ' ' + request.path)
+      ?? (request.method === 'PATCH' && /^\/api\/brands\/[^/]+$/.test(request.path) ? 'renameBrand' : 'unknown');
     const traceId = randomUUID();
     response.locals.traceId = traceId;
     if (api) {
       response.set({ 'Cache-Control': 'private, no-store', 'X-Trace-Id': traceId });
       response.on('finish', () => console.info(JSON.stringify({
-        traceId, operation, status: response.statusCode, accountId: response.locals.accountId,
+        traceId, operation, status: response.statusCode, accountId: response.locals.accountId, brandId: response.locals.brandId,
       })));
     }
 
@@ -189,7 +287,7 @@ export async function createApp(options: AppOptions = {}) {
   });
 
   try {
-    const app = await NestFactory.create<NestExpressApplication>(AuthModule.withService(auth), new ExpressAdapter(server), {
+    const app = await NestFactory.create<NestExpressApplication>(ApiModule.withServices(auth, db), new ExpressAdapter(server), {
       bodyParser: false,
       logger: false,
       abortOnError: false,

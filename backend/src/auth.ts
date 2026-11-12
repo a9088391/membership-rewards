@@ -26,7 +26,7 @@ export const invalidInput = () => new ApiError(400, 'INVALID_INPUT', '輸入格�
 const invalidLogin = () => new ApiError(401, 'INVALID_CREDENTIALS', '帳號或密碼錯誤。');
 const unauthenticated = () => new ApiError(401, 'UNAUTHENTICATED', '請先登入。');
 
-function readBody(body: unknown, keys: string[]): Record<string, unknown> {
+export function readBody(body: unknown, keys: string[]): Record<string, unknown> {
   if (body === null || typeof body !== 'object' || Array.isArray(body)
       || Object.keys(body).length !== keys.length || keys.some((key) => !Object.hasOwn(body, key))) {
     throw invalidInput();
