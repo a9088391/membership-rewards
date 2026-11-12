@@ -40,9 +40,25 @@ model Brand {
   seedKey   String?           @unique
   createdAt DateTime          @default(now()) @db.Timestamptz(3)
   grants    BrandAdminGrant[]
+  offers    CouponOffer[]
   pointAccounts PointAccount[]
 
   @@index([createdAt, id])
+}
+
+model CouponOffer {
+  id          String    @id @db.Uuid
+  brandId     String    @db.Uuid
+  name        String    @db.VarChar(80)
+  description String    @db.VarChar(500)
+  points      Int
+  startsAt    DateTime  @db.Timestamptz(3)
+  endsAt      DateTime  @db.Timestamptz(3)
+  stoppedAt   DateTime? @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  brand       Brand     @relation(fields: [brandId], references: [id], onDelete: Restrict)
+
+  @@index([brandId, createdAt, id])
 }
 
 model BrandAdminGrant {

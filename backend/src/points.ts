@@ -1,11 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { ApiError, invalidInput, readBody } from './auth.js';
+import { forbidden, missingResource, requireBrand, resourceIdPattern } from './brand-access.js';
 import { PointSource, Prisma, Role, type PrismaClient } from './generated/client.js';
 
-export const resourceIdPattern = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 const maxBalance = 2147483647;
-const missingResource = () => new ApiError(404, 'NOT_FOUND', '找不到此資源。');
-export const forbidden = () => new ApiError(403, 'FORBIDDEN', '沒有權限執行此操作。');
+
+export function isPositivePoints(points: unknown): points is number {
+  return typeof points === 'number' && Number.isInteger(points) && points >= 1 && points <= maxBalance;
+}
 
 type Transaction = Prisma.TransactionClient;
 type PointAccount = { brandId: string; memberId: string };
@@ -22,18 +24,8 @@ async function pointSubject(tx: Transaction, actor: PointActor, target: PointTar
   const { role, memberNumber, displayName } = actor.identity;
   if (own ? role !== Role.MEMBER : role === Role.MEMBER) throw forbidden();
   if (!resourceIdPattern.test(target.brandId)) throw invalidInput();
-  const brandId = target.brandId.toLowerCase();
+  const brandId = await requireBrand(tx, actor, target.brandId, lock);
   const lockAuthorization = lock ? Prisma.sql`FOR SHARE` : Prisma.empty;
-
-  // 品牌管理員只能由現有授權進入品牌，且加點提交前不能並行移除該授權。
-  const brand = role === Role.BRAND_ADMIN
-    ? (await tx.$queryRaw<{ brandId: string }[]>`
-        SELECT "brandId" FROM "BrandAdminGrant"
-        WHERE "accountId" = ${actor.accountId}::uuid AND "brandId" = ${brandId}::uuid
-        ${lockAuthorization}
-      `)[0]
-    : await tx.brand.findUnique({ where: { id: brandId }, select: { id: true } });
-  if (!brand) throw missingResource();
 
   if (target.memberNumber === undefined) {
     return { account: { brandId, memberId: actor.accountId }, memberNumber, displayName };
@@ -106,8 +98,7 @@ export async function appendPointCredit(
 function readGrant(key: string | undefined, body: unknown) {
   if (key === undefined || !resourceIdPattern.test(key)) throw invalidInput();
   const { points, reason } = readBody(body, ['points', 'reason']);
-  if (typeof points !== 'number' || !Number.isInteger(points) || points < 1 || points > maxBalance
-      || typeof reason !== 'string' || !reason.isWellFormed()) throw invalidInput();
+  if (!isPositivePoints(points) || typeof reason !== 'string' || !reason.isWellFormed()) throw invalidInput();
   const normalized = reason.trim();
   if (normalized.length === 0 || [...normalized].length > 200 || /\p{Cc}/u.test(normalized)) throw invalidInput();
   return { key: key.toLowerCase(), points, reason: normalized };

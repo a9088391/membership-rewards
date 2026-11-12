@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { Offers } from './offers';
 import { Points } from './points';
 import { apiRequest, errorNotice, NoticeBox, type ApiResult, type Notice } from './request';
 
@@ -67,7 +68,8 @@ function Brands({ identity, active, onAccessDenied, sessionInterrupted }: {
   sessionInterrupted: () => boolean;
 }) {
   const [page, setPage] = useState(1);
-  const [pointsBrandId, setPointsBrandId] = useState<string | null>(null);
+  const [panel, setPanel] = useState<{ kind: 'points' | 'offers'; brandId: string } | null>(null);
+  const [retainedOfferBrands, setRetainedOfferBrands] = useState<Brand[]>([]);
   const [pointsDenial, setPointsDenial] = useState<Notice | null>(null);
   const [list, setList] = useState<BrandPage | null>(null);
   const [activity, setActivity] = useState<'loading' | 'saving' | null>('loading');
@@ -79,9 +81,19 @@ function Brands({ identity, active, onAccessDenied, sessionInterrupted }: {
   const title = useRef<HTMLHeadingElement>(null);
 
   const canWrite = identity.role === 'GROUP_ADMIN';
-  const pointsBrand = list?.items.find(({ id }) => id === pointsBrandId);
+  const selectedBrand = list?.items.find(({ id }) => id === panel?.brandId);
+  const selectedOfferBrand = panel?.kind === 'offers' ? selectedBrand : undefined;
+  const offerBrands = selectedOfferBrand
+    ? [...retainedOfferBrands.filter(({ id }) => id !== selectedOfferBrand.id), selectedOfferBrand]
+    : retainedOfferBrands;
+
+  // 切換面板只保留仍在處理或待確認的寫入，各品牌沿用原元件。
+  function retainOfferBrand(brand: Brand, retain: boolean) {
+    setRetainedOfferBrands((previous) => retain ? [...previous, brand] : previous.filter(({ id }) => id !== brand.id));
+  }
+
   const denyPointsAccess = useCallback((notice: Notice) => {
-    setPointsBrandId(null);
+    setPanel(null);
     setPointsDenial(notice);
     onAccessDenied();
   }, [onAccessDenied]);
@@ -133,9 +145,15 @@ function Brands({ identity, active, onAccessDenied, sessionInterrupted }: {
 
   function browse(target: number) {
     if (active) void run('loading', (signal) => {
-      if (target !== page) setPointsBrandId(null);
+      if (target !== page) setPanel(null);
       return loadPage(target, signal);
     });
+  }
+
+  function togglePanel(kind: 'points' | 'offers', brandId: string) {
+    if (!active || sessionInterrupted()) return;
+    setPointsDenial(null);
+    setPanel((current) => current?.kind === kind && current.brandId === brandId ? null : { kind, brandId });
   }
 
   function save(event: FormEvent<HTMLFormElement>, current?: Brand) {
@@ -231,13 +249,13 @@ function Brands({ identity, active, onAccessDenied, sessionInterrupted }: {
                 <span>{brand.name}</span>
                 <span className="brand-id">品牌 ID {brand.id}</span>
                 <button type="button" aria-label={`查看點數：${brand.name}（品牌 ID ${brand.id}）`}
-                  aria-expanded={pointsBrandId === brand.id}
-                  aria-controls={pointsBrandId === brand.id ? 'brand-points' : undefined}
-                  onClick={() => {
-                    if (sessionInterrupted()) return;
-                    setPointsDenial(null);
-                    setPointsBrandId((current) => current === brand.id ? null : brand.id);
-                  }}>查看點數</button>
+                  aria-expanded={panel?.kind === 'points' && panel.brandId === brand.id}
+                  aria-controls={panel?.kind === 'points' && panel.brandId === brand.id ? 'brand-points' : undefined}
+                  onClick={() => togglePanel('points', brand.id)}>查看點數</button>
+                <button type="button" aria-label={`查看優惠券方案：${brand.name}（品牌 ID ${brand.id}）`}
+                  aria-expanded={panel?.kind === 'offers' && panel.brandId === brand.id}
+                  aria-controls={panel?.kind === 'offers' && panel.brandId === brand.id ? 'brand-offers' : undefined}
+                  onClick={() => togglePanel('offers', brand.id)}>查看優惠券方案</button>
                 {canWrite && (
                   <button type="button" aria-label={`改名：${brand.name}（品牌 ID ${brand.id}）`}
                     aria-disabled={writeLocked || !!edit} onClick={() => {
@@ -281,11 +299,16 @@ function Brands({ identity, active, onAccessDenied, sessionInterrupted }: {
         </form>
       )}
       {pointsDenial && <NoticeBox notice={pointsDenial} />}
-      {pointsBrand && (
-        <Points key={pointsBrand.id} brand={pointsBrand} active={active} isMember={identity.role === 'MEMBER'}
+      {selectedBrand && panel?.kind === 'points' && (
+        <Points key={selectedBrand.id} brand={selectedBrand} active={active} isMember={identity.role === 'MEMBER'}
           actor={identity.username} sessionInterrupted={sessionInterrupted}
           onAccessDenied={denyPointsAccess} />
       )}
+      {offerBrands.map((brand) => (
+        <Offers key={brand.id} brand={brand} active={active && brand.id === selectedOfferBrand?.id}
+          isMember={identity.role === 'MEMBER'} actor={identity.username} sessionInterrupted={sessionInterrupted}
+          onAccessDenied={onAccessDenied} retainBrand={retainOfferBrand} />
+      ))}
     </section>
   );
 }

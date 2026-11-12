@@ -9,6 +9,7 @@ import {
   Get,
   HttpCode,
   HttpException,
+  Inject,
   Module,
   NotFoundException,
   Param,
@@ -25,9 +26,13 @@ import { NestFactory } from '@nestjs/core';
 import { ExpressAdapter, type NestExpressApplication } from '@nestjs/platform-express';
 import express, { type Request, type Response } from 'express';
 import { ApiError, AuthService, invalidInput, readBody, sessionCookie, sessionCookieOptions } from './auth.js';
+import { resourceIdPattern } from './brand-access.js';
 import { createDatabase } from './database.js';
 import { Prisma, PrismaClient, Role } from './generated/client.js';
-import { grantPoints, readPoints, resourceIdPattern } from './points.js';
+import { createOffer, listOffers, stopOffer } from './offers.js';
+import { grantPoints, readPoints } from './points.js';
+
+const appClock = Symbol('appClock');
 
 type AppOptions = {
   frontend?: (request: Request, response: Response) => Promise<unknown>;
@@ -171,23 +176,23 @@ class BrandController {
   }
 }
 
+function authenticateBrandRequest(auth: AuthService, request: Request, response: Response, brandId: string, lock = false) {
+  return async (tx: Prisma.TransactionClient) => {
+    const actor = await auth.me(readSession(request), tx, lock);
+    response.locals.accountId = actor.accountId;
+    if (resourceIdPattern.test(brandId)) response.locals.brandId = brandId.toLowerCase();
+    // 以 Cookie 查得的身分為準，防止其他分頁已切換帳號時讀寫舊畫面的資料。
+    const expectedActor = request.header('X-Membership-Actor');
+    if (expectedActor !== undefined && expectedActor !== actor.identity.username) {
+      throw new ApiError(403, 'FORBIDDEN', '登入身分已變更，請重新確認後再試。');
+    }
+    return actor;
+  };
+}
+
 @Controller('api/brands/:brandId')
 class PointsController {
   constructor(private readonly auth: AuthService, private readonly db: PrismaClient) {}
-
-  private authenticate(request: Request, response: Response, brandId: string, lock = false) {
-    return async (tx: Prisma.TransactionClient) => {
-      const actor = await this.auth.me(readSession(request), tx, lock);
-      response.locals.accountId = actor.accountId;
-      if (resourceIdPattern.test(brandId)) response.locals.brandId = brandId.toLowerCase();
-      // 以 Cookie 查得的身分為準，防止其他分頁已切換帳號時讀寫舊畫面的資料。
-      const expectedActor = request.header('X-Membership-Actor');
-      if (expectedActor !== undefined && expectedActor !== actor.identity.username) {
-        throw new ApiError(403, 'FORBIDDEN', '登入身分已變更，請重新確認後再試。');
-      }
-      return actor;
-    };
-  }
 
   @Get('me/points')
   myPoints(
@@ -195,7 +200,7 @@ class PointsController {
     @Req() request: Request,
     @Res({ passthrough: true }) response: Response,
   ) {
-    return readPoints(this.db, this.authenticate(request, response, brandId), { brandId });
+    return readPoints(this.db, authenticateBrandRequest(this.auth, request, response, brandId), { brandId });
   }
 
   @Get('me/ledger')
@@ -206,7 +211,7 @@ class PointsController {
     @Req() request: Request,
     @Res({ passthrough: true }) response: Response,
   ) {
-    return readPoints(this.db, this.authenticate(request, response, brandId), { brandId }, () => readPage(page, pageSize));
+    return readPoints(this.db, authenticateBrandRequest(this.auth, request, response, brandId), { brandId }, () => readPage(page, pageSize));
   }
 
   @Get('members/:memberNumber')
@@ -216,7 +221,7 @@ class PointsController {
     @Req() request: Request,
     @Res({ passthrough: true }) response: Response,
   ) {
-    return readPoints(this.db, this.authenticate(request, response, brandId), { brandId, memberNumber });
+    return readPoints(this.db, authenticateBrandRequest(this.auth, request, response, brandId), { brandId, memberNumber });
   }
 
   @Get('members/:memberNumber/ledger')
@@ -229,7 +234,7 @@ class PointsController {
     @Res({ passthrough: true }) response: Response,
   ) {
     return readPoints(
-      this.db, this.authenticate(request, response, brandId), { brandId, memberNumber }, () => readPage(page, pageSize),
+      this.db, authenticateBrandRequest(this.auth, request, response, brandId), { brandId, memberNumber }, () => readPage(page, pageSize),
     );
   }
 
@@ -241,30 +246,75 @@ class PointsController {
     @Req() request: Request,
     @Res({ passthrough: true }) response: Response,
   ) {
-    let status = 201;
-    try {
-      return await grantPoints(
-        this.db, this.authenticate(request, response, brandId, true), { brandId, memberNumber },
-        request.header('Idempotency-Key'), body,
-      );
-    } catch (error) {
-      status = error instanceof ApiError ? error.status : 503;
-      throw error;
-    } finally {
-      // 記錄業務結果，即使客戶端在提交前斷線，HTTP 回應不會觸發 finish。
-      response.locals.grantAudited = true;
-      logApiOutcome(response, 'grantPoints', status);
-    }
+    const authenticate = authenticateBrandRequest(this.auth, request, response, brandId, true);
+    return auditWrite(response, 'grantPoints', 201, () => grantPoints(
+      this.db, authenticate, { brandId, memberNumber }, request.header('Idempotency-Key'), body,
+    ));
+  }
+}
+
+@Controller('api/brands/:brandId/offers')
+class OffersController {
+  constructor(
+    private readonly auth: AuthService,
+    private readonly db: PrismaClient,
+    @Inject(appClock) private readonly clock: () => Date,
+  ) {}
+
+  @Get()
+  list(
+    @Param('brandId') brandId: string,
+    @Query('page') page: unknown,
+    @Query('pageSize') pageSize: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const authenticate = authenticateBrandRequest(this.auth, request, response, brandId);
+    return listOffers(this.db, authenticate, brandId, () => readPage(page, pageSize), this.clock);
+  }
+
+  @Post()
+  create(
+    @Param('brandId') brandId: string,
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const authenticate = authenticateBrandRequest(this.auth, request, response, brandId, true);
+    return auditWrite(response, 'createOffer', 201, async () => {
+      const offer = await createOffer(this.db, authenticate, brandId, body, this.clock);
+      response.locals.offerId = offer.id;
+      return offer;
+    });
+  }
+
+  @Post(':offerId/stop')
+  @HttpCode(200)
+  stop(
+    @Param('brandId') brandId: string,
+    @Param('offerId') offerId: string,
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const authenticate = authenticateBrandRequest(this.auth, request, response, brandId, true);
+    return auditWrite(response, 'stopOffer', 200, async () => {
+      const offer = await stopOffer(this.db, authenticate, brandId, offerId, body, this.clock);
+      response.locals.offerId = offer.id;
+      return offer;
+    });
   }
 }
 
 @Module({})
 class ApiModule {
-  static withServices(auth: AuthService, db: PrismaClient): DynamicModule {
+  static withServices(auth: AuthService, db: PrismaClient, clock: () => Date): DynamicModule {
     return {
       module: ApiModule,
-      controllers: [AuthController, BrandController, PointsController],
-      providers: [{ provide: AuthService, useValue: auth }, { provide: PrismaClient, useValue: db }],
+      controllers: [AuthController, BrandController, PointsController, OffersController],
+      providers: [
+        { provide: AuthService, useValue: auth }, { provide: PrismaClient, useValue: db }, { provide: appClock, useValue: clock },
+      ],
     };
   }
 }
@@ -297,7 +347,7 @@ class ErrorFilter implements ExceptionFilter {
 
 const jsonOptions = { limit: 16 * 1024, inflate: false };
 const parseJson = express.json(jsonOptions);
-const parseGrantJson = express.json({
+const parsePointsJson = express.json({
   ...jsonOptions,
   reviver(key: string, value: unknown, context?: { source: string }) {
     if (key !== 'points' || typeof value !== 'number' || value <= 0 || !Number.isInteger(value)) return value;
@@ -332,11 +382,27 @@ const brandOperations: [string[], RegExp, string][] = [
   [['GET', 'HEAD'], /^\/api\/brands\/[^/]+\/members\/[^/]+$/, 'memberPoints'],
   [['GET', 'HEAD'], /^\/api\/brands\/[^/]+\/members\/[^/]+\/ledger$/, 'memberLedger'],
   [['POST'], /^\/api\/brands\/[^/]+\/members\/[^/]+\/grants$/, 'grantPoints'],
+  [['GET', 'HEAD'], /^\/api\/brands\/[^/]+\/offers$/, 'listOffers'],
+  [['POST'], /^\/api\/brands\/[^/]+\/offers$/, 'createOffer'],
+  [['POST'], /^\/api\/brands\/[^/]+\/offers\/[^/]+\/stop$/, 'stopOffer'],
 ];
 
 function logApiOutcome(response: Response, operation: string, status: number) {
-  const { traceId, accountId, brandId } = response.locals;
-  console.info(JSON.stringify({ traceId, operation, status, accountId, brandId }));
+  const { traceId, accountId, brandId, offerId } = response.locals;
+  console.info(JSON.stringify({ traceId, operation, status, accountId, brandId, offerId }));
+}
+
+async function auditWrite<T>(response: Response, operation: string, status: number, write: () => Promise<T>) {
+  try {
+    return await write();
+  } catch (error) {
+    status = error instanceof ApiError ? error.status : 503;
+    throw error;
+  } finally {
+    // 即使客戶端在提交前斷線，仍記錄交易結果且每次請求只記一筆。
+    response.locals.writeAudited = true;
+    logApiOutcome(response, operation, status);
+  }
 }
 
 async function readConfig() {
@@ -359,7 +425,8 @@ async function readConfig() {
 export async function createApp(options: AppOptions = {}) {
   const { origin, host, key } = await readConfig();
   const db = createDatabase();
-  const auth = new AuthService(db, key, options.clock ?? (() => new Date()));
+  const clock = options.clock ?? (() => new Date());
+  const auth = new AuthService(db, key, clock);
   const server = express();
   server.disable('x-powered-by');
   server.disable('etag');
@@ -377,7 +444,7 @@ export async function createApp(options: AppOptions = {}) {
     if (api) {
       response.set({ 'Cache-Control': 'private, no-store', 'X-Trace-Id': traceId });
       response.on('finish', () => {
-        if (!response.locals.grantAudited) logApiOutcome(response, operation, response.statusCode);
+        if (!response.locals.writeAudited) logApiOutcome(response, operation, response.statusCode);
       });
     }
 
@@ -410,7 +477,7 @@ export async function createApp(options: AppOptions = {}) {
         await options.frontend(request, response);
         return;
       }
-      const parseBody = operation === 'grantPoints' ? parseGrantJson : parseJson;
+      const parseBody = operation === 'grantPoints' || operation === 'createOffer' ? parsePointsJson : parseJson;
       parseBody(request, response, (error) => {
         if (error) respondError(response, invalidInput());
         else next();
@@ -421,7 +488,7 @@ export async function createApp(options: AppOptions = {}) {
   });
 
   try {
-    const app = await NestFactory.create<NestExpressApplication>(ApiModule.withServices(auth, db), new ExpressAdapter(server), {
+    const app = await NestFactory.create<NestExpressApplication>(ApiModule.withServices(auth, db, clock), new ExpressAdapter(server), {
       bodyParser: false,
       logger: false,
       abortOnError: false,

@@ -204,24 +204,25 @@ form + [role='status'] {
   cursor: default;
 }
 
-.points {
+.points, .offers {
   padding-top: 1rem;
   border-top: 1px solid #d7e2dd;
 }
 
-.points h3, .points h4 {
+.points h3, .points h4, .offers h3, .offers h4 {
   margin: 0;
 }
 
-.points form h4 {
+.points form h4, .offers form h4 {
   margin-bottom: 0.75rem;
 }
 
-.points > :not(h3) + *, .points form > input + button, .points section > :not(h4) + * {
+.points > :not(h3) + *, .points form > input + button, .points section > :not(h4) + *,
+.offers > :not(h3) + *, .offers input + label {
   margin-top: 0.75rem;
 }
 
-.points textarea {
+.points textarea, .offers textarea {
   width: 100%;
   padding: 0.625rem 0.75rem;
   border: 1px solid #7a8e87;
@@ -234,4 +235,22 @@ form + [role='status'] {
 .points button:disabled {
   background: #4a6b63;
   cursor: default;
+}
+
+.offers-list dl {
+  margin: 0.5rem 0;
+}
+
+.offers-list dl > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 0.5rem;
+}
+
+.offers-list dt {
+  color: #465c56;
+}
+
+.offers-list dd {
+  margin: 0;
 }
