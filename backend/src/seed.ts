@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createDatabase } from './database.js';
-import { Prisma, Role } from './generated/client.js';
+import { PointSource, Prisma, Role } from './generated/client.js';
 import { hashPassword } from './password.js';
+import { appendPointCredit, lockPointAccount } from './points.js';
 
 const accounts = [
   { username: 'demo_member', displayName: '示範會員', role: Role.MEMBER },
@@ -71,6 +72,26 @@ async function seed(): Promise<void> {
       });
       if (granted !== brandAssignments.length) {
         throw new Error('必要示範品牌授權未建立');
+      }
+
+      const member = await tx.account.findUniqueOrThrow({
+        where: { username: 'demo_member' }, select: { id: true, role: true },
+      });
+      const coffee = await tx.brand.findUniqueOrThrow({ where: { seedKey: 'coffee' }, select: { id: true } });
+      const pointAccount = { brandId: coffee.id, memberId: member.id };
+      const balance = await lockPointAccount(tx, pointAccount);
+      // 以同一帳戶鎖保護種子流水的存在檢查及加點，重跑初始化只補缺少的流水。
+      const seeded = await tx.pointLedger.findFirst({
+        where: { ...pointAccount, source: PointSource.SEED }, select: { id: true },
+      });
+      if (!seeded) {
+        const admin = await tx.account.findUniqueOrThrow({
+          where: { username: 'group_admin', role: Role.GROUP_ADMIN }, select: { id: true },
+        });
+        if (member.role !== Role.MEMBER) throw new Error('示範會員角色錯誤');
+        await appendPointCredit(tx, pointAccount, {
+          actorId: admin.id, amount: 100, reason: '示範初始點數', source: PointSource.SEED,
+        }, balance + 100);
       }
     });
   } finally {

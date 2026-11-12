@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import {
   BadRequestException,
@@ -27,6 +27,7 @@ import express, { type Request, type Response } from 'express';
 import { ApiError, AuthService, invalidInput, readBody, sessionCookie, sessionCookieOptions } from './auth.js';
 import { createDatabase } from './database.js';
 import { Prisma, PrismaClient, Role } from './generated/client.js';
+import { grantPoints, readPoints, resourceIdPattern } from './points.js';
 
 type AppOptions = {
   frontend?: (request: Request, response: Response) => Promise<unknown>;
@@ -38,6 +39,11 @@ function readSession(request: Request) {
     .map((field) => field.trim())
     .filter((field) => field.startsWith(sessionCookie + '='));
   return values?.length === 1 ? values[0].slice(sessionCookie.length + 1) : undefined;
+}
+
+function sessionTag(token: string) {
+  // 讓前端識別工作階段更替，登入憑證仍只經 HttpOnly Cookie 傳送。
+  return createHash('sha256').update('membership-rewards/session-tag/v1\0').update(token).digest('base64url');
 }
 
 @Controller('api/auth')
@@ -55,13 +61,16 @@ class AuthController {
     const result = await this.auth.login(body, readSession(request));
     response.locals.accountId = result.accountId;
     response.cookie(sessionCookie, result.token, { ...sessionCookieOptions, maxAge: result.maxAge });
+    response.set('X-Membership-Session', sessionTag(result.token));
     return result.identity;
   }
 
   @Get('me')
   async me(@Req() request: Request, @Res({ passthrough: true }) response: Response) {
-    const result = await this.auth.me(readSession(request));
+    const token = readSession(request);
+    const result = await this.auth.me(token);
     response.locals.accountId = result.accountId;
+    if (token) response.set('X-Membership-Session', sessionTag(token));
     return result.identity;
   }
 
@@ -74,7 +83,6 @@ class AuthController {
 }
 
 const brandFields = { id: true, name: true } as const;
-const brandIdPattern = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 
 function readBrandName(input: unknown) {
   const { name } = readBody(input, ['name']);
@@ -90,6 +98,14 @@ function positiveInteger(value: unknown, fallback: number) {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed)) throw invalidInput();
   return parsed;
+}
+
+function readPage(pageInput: unknown, pageSizeInput: unknown) {
+  const page = positiveInteger(pageInput, 1);
+  const pageSize = positiveInteger(pageSizeInput, 20);
+  const skip = (page - 1) * pageSize;
+  if (pageSize > 100 || !Number.isSafeInteger(skip)) throw invalidInput();
+  return { skip, pageSize };
 }
 
 @Controller('api/brands')
@@ -111,10 +127,7 @@ class BrandController {
   ) {
     const { accountId } = await this.auth.me(readSession(request));
     response.locals.accountId = accountId;
-    const page = positiveInteger(pageInput, 1);
-    const pageSize = positiveInteger(pageSizeInput, 20);
-    const skip = (page - 1) * pageSize;
-    if (pageSize > 100 || !Number.isSafeInteger(skip)) throw invalidInput();
+    const { skip, pageSize } = readPage(pageInput, pageSizeInput);
     const items = await this.db.brand.findMany({
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
       skip,
@@ -143,7 +156,7 @@ class BrandController {
     @Res({ passthrough: true }) response: Response,
   ) {
     await this.requireGroupAdmin(request, response);
-    if (!brandIdPattern.test(id)) throw invalidInput();
+    if (!resourceIdPattern.test(id)) throw invalidInput();
     const name = readBrandName(body);
     try {
       const brand = await this.db.brand.update({ where: { id }, data: { name }, select: brandFields });
@@ -158,12 +171,99 @@ class BrandController {
   }
 }
 
+@Controller('api/brands/:brandId')
+class PointsController {
+  constructor(private readonly auth: AuthService, private readonly db: PrismaClient) {}
+
+  private authenticate(request: Request, response: Response, brandId: string, lock = false) {
+    return async (tx: Prisma.TransactionClient) => {
+      const actor = await this.auth.me(readSession(request), tx, lock);
+      response.locals.accountId = actor.accountId;
+      if (resourceIdPattern.test(brandId)) response.locals.brandId = brandId.toLowerCase();
+      // 以 Cookie 查得的身分為準，防止其他分頁已切換帳號時讀寫舊畫面的資料。
+      const expectedActor = request.header('X-Membership-Actor');
+      if (expectedActor !== undefined && expectedActor !== actor.identity.username) {
+        throw new ApiError(403, 'FORBIDDEN', '登入身分已變更，請重新確認後再試。');
+      }
+      return actor;
+    };
+  }
+
+  @Get('me/points')
+  myPoints(
+    @Param('brandId') brandId: string,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    return readPoints(this.db, this.authenticate(request, response, brandId), { brandId });
+  }
+
+  @Get('me/ledger')
+  myLedger(
+    @Param('brandId') brandId: string,
+    @Query('page') page: unknown,
+    @Query('pageSize') pageSize: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    return readPoints(this.db, this.authenticate(request, response, brandId), { brandId }, () => readPage(page, pageSize));
+  }
+
+  @Get('members/:memberNumber')
+  memberPoints(
+    @Param('brandId') brandId: string,
+    @Param('memberNumber') memberNumber: string,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    return readPoints(this.db, this.authenticate(request, response, brandId), { brandId, memberNumber });
+  }
+
+  @Get('members/:memberNumber/ledger')
+  memberLedger(
+    @Param('brandId') brandId: string,
+    @Param('memberNumber') memberNumber: string,
+    @Query('page') page: unknown,
+    @Query('pageSize') pageSize: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    return readPoints(
+      this.db, this.authenticate(request, response, brandId), { brandId, memberNumber }, () => readPage(page, pageSize),
+    );
+  }
+
+  @Post('members/:memberNumber/grants')
+  async grant(
+    @Param('brandId') brandId: string,
+    @Param('memberNumber') memberNumber: string,
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    let status = 201;
+    try {
+      return await grantPoints(
+        this.db, this.authenticate(request, response, brandId, true), { brandId, memberNumber },
+        request.header('Idempotency-Key'), body,
+      );
+    } catch (error) {
+      status = error instanceof ApiError ? error.status : 503;
+      throw error;
+    } finally {
+      // 記錄業務結果，即使客戶端在提交前斷線，HTTP 回應不會觸發 finish。
+      response.locals.grantAudited = true;
+      logApiOutcome(response, 'grantPoints', status);
+    }
+  }
+}
+
 @Module({})
 class ApiModule {
   static withServices(auth: AuthService, db: PrismaClient): DynamicModule {
     return {
       module: ApiModule,
-      controllers: [AuthController, BrandController],
+      controllers: [AuthController, BrandController, PointsController],
       providers: [{ provide: AuthService, useValue: auth }, { provide: PrismaClient, useValue: db }],
     };
   }
@@ -195,7 +295,25 @@ class ErrorFilter implements ExceptionFilter {
   }
 }
 
-const parseJson = express.json({ limit: 16 * 1024, inflate: false });
+const jsonOptions = { limit: 16 * 1024, inflate: false };
+const parseJson = express.json(jsonOptions);
+const parseGrantJson = express.json({
+  ...jsonOptions,
+  reviver(key: string, value: unknown, context?: { source: string }) {
+    if (key !== 'points' || typeof value !== 'number' || value <= 0 || !Number.isInteger(value)) return value;
+    // 十進位數即使被 Number 捨入成整數，原始有效數字也必須能消去全部小數位。
+    if (!context) return NaN;
+    const [significand, exponent = '0'] = context.source.split(/[eE]/);
+    const decimal = significand.indexOf('.');
+    const fractionalDigits = decimal < 0 ? 0 : significand.length - decimal - 1;
+    const digits = significand.replace('.', '');
+    const places = fractionalDigits - Number(exponent);
+    for (let offset = 1; offset <= places; offset += 1) {
+      if (digits.at(-offset) !== '0') return NaN;
+    }
+    return value;
+  },
+});
 const operations = new Map([
   ['POST /api/auth/register', 'register'],
   ['POST /api/auth/login', 'login'],
@@ -206,6 +324,20 @@ const operations = new Map([
   ['HEAD /api/brands', 'listBrands'],
   ['POST /api/brands', 'createBrand'],
 ]);
+
+const brandOperations: [string[], RegExp, string][] = [
+  [['PATCH'], /^\/api\/brands\/[^/]+$/, 'renameBrand'],
+  [['GET', 'HEAD'], /^\/api\/brands\/[^/]+\/me\/points$/, 'myPoints'],
+  [['GET', 'HEAD'], /^\/api\/brands\/[^/]+\/me\/ledger$/, 'myLedger'],
+  [['GET', 'HEAD'], /^\/api\/brands\/[^/]+\/members\/[^/]+$/, 'memberPoints'],
+  [['GET', 'HEAD'], /^\/api\/brands\/[^/]+\/members\/[^/]+\/ledger$/, 'memberLedger'],
+  [['POST'], /^\/api\/brands\/[^/]+\/members\/[^/]+\/grants$/, 'grantPoints'],
+];
+
+function logApiOutcome(response: Response, operation: string, status: number) {
+  const { traceId, accountId, brandId } = response.locals;
+  console.info(JSON.stringify({ traceId, operation, status, accountId, brandId }));
+}
 
 async function readConfig() {
   const origin = process.env.APP_ORIGIN;
@@ -238,14 +370,15 @@ export async function createApp(options: AppOptions = {}) {
   server.use(async (request, response, next) => {
     const api = request.path === '/api' || request.path.startsWith('/api/');
     const operation = operations.get(request.method + ' ' + request.path)
-      ?? (request.method === 'PATCH' && /^\/api\/brands\/[^/]+$/.test(request.path) ? 'renameBrand' : 'unknown');
+      ?? brandOperations.find(([methods, path]) => methods.includes(request.method) && path.test(request.path))?.[2]
+      ?? 'unknown';
     const traceId = randomUUID();
     response.locals.traceId = traceId;
     if (api) {
       response.set({ 'Cache-Control': 'private, no-store', 'X-Trace-Id': traceId });
-      response.on('finish', () => console.info(JSON.stringify({
-        traceId, operation, status: response.statusCode, accountId: response.locals.accountId, brandId: response.locals.brandId,
-      })));
+      response.on('finish', () => {
+        if (!response.locals.grantAudited) logApiOutcome(response, operation, response.statusCode);
+      });
     }
 
     try {
@@ -277,7 +410,8 @@ export async function createApp(options: AppOptions = {}) {
         await options.frontend(request, response);
         return;
       }
-      parseJson(request, response, (error) => {
+      const parseBody = operation === 'grantPoints' ? parseGrantJson : parseJson;
+      parseBody(request, response, (error) => {
         if (error) respondError(response, invalidInput());
         else next();
       });

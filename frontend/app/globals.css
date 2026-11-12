@@ -203,3 +203,35 @@ form + [role='status'] {
   background: #4a6b63;
   cursor: default;
 }
+
+.points {
+  padding-top: 1rem;
+  border-top: 1px solid #d7e2dd;
+}
+
+.points h3, .points h4 {
+  margin: 0;
+}
+
+.points form h4 {
+  margin-bottom: 0.75rem;
+}
+
+.points > :not(h3) + *, .points form > input + button, .points section > :not(h4) + * {
+  margin-top: 0.75rem;
+}
+
+.points textarea {
+  width: 100%;
+  padding: 0.625rem 0.75rem;
+  border: 1px solid #7a8e87;
+  border-radius: 0.5rem;
+  color: inherit;
+  font: inherit;
+  resize: vertical;
+}
+
+.points button:disabled {
+  background: #4a6b63;
+  cursor: default;
+}

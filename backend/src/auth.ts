@@ -170,7 +170,7 @@ export class AuthService {
     return result;
   }
 
-  private async findActiveSession(token: string | undefined) {
+  private async findActiveSession(token: string | undefined, tx?: Transaction, lock = false) {
     if (!token) return null;
     const now = this.clock().getTime() / 1000;
     let claims: { sub: string; jti: string; iat: number; exp: number };
@@ -186,7 +186,14 @@ export class AuthService {
       return null;
     }
 
-    const session = await this.db.session.findUnique({
+    if (tx && lock) {
+      // 保留本次業務寫入採用的工作階段及角色，讓並行撤銷或變更角色與寫入有明確順序。
+      await tx.$queryRaw`
+        SELECT s."id" FROM "Session" s JOIN "Account" a ON a."id" = s."accountId"
+        WHERE s."id" = ${claims.jti}::uuid AND a."id" = ${claims.sub}::uuid FOR SHARE OF s, a
+      `;
+    }
+    const session = await (tx ?? this.db).session.findUnique({
       where: { id: claims.jti },
       include: { account: { select: identityFields } },
     });
@@ -198,14 +205,14 @@ export class AuthService {
     return session;
   }
 
-  private async requireActiveSession(token: string | undefined) {
-    const session = await this.findActiveSession(token);
+  private async requireActiveSession(token: string | undefined, tx?: Transaction, lock = false) {
+    const session = await this.findActiveSession(token, tx, lock);
     if (!session) throw unauthenticated();
     return session;
   }
 
-  async me(token: string | undefined) {
-    const session = await this.requireActiveSession(token);
+  async me(token: string | undefined, tx?: Transaction, lock = false) {
+    const session = await this.requireActiveSession(token, tx, lock);
     return { accountId: session.accountId, identity: session.account };
   }
 

@@ -1,6 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { Points } from './points';
+import { apiRequest, errorNotice, NoticeBox, type ApiResult, type Notice } from './request';
 
 const roles = {
   MEMBER: '會員',
@@ -15,19 +17,12 @@ type Identity = {
   memberNumber: string | null;
 };
 
+type ConfirmedSession = { identity: Identity; sessionTag: string };
 type Session =
-  | { status: 'checking' | 'unavailable'; identity?: Identity }
-  | { status: 'anonymous'; identity?: never }
-  | { status: 'authenticated'; identity: Identity };
+  | { status: 'checking' | 'unavailable'; confirmed?: ConfirmedSession }
+  | { status: 'anonymous'; confirmed?: never }
+  | { status: 'authenticated'; confirmed: ConfirmedSession };
 
-type Notice = {
-  kind: 'status' | 'alert';
-  message: string;
-  traceId?: string;
-  retryAfterSeconds?: number;
-};
-
-type ApiResult = { status: number; body: unknown };
 const sessionChangeKey = 'membership-rewards:session-change';
 
 function readSessionChange() {
@@ -46,53 +41,8 @@ function isIdentity(body: unknown): body is Identity {
     && (role === 'MEMBER' ? typeof memberNumber === 'string' : memberNumber === null);
 }
 
-function errorNotice({ body }: ApiResult, fallback: string): Notice {
-  if (body && typeof body === 'object') {
-    const { code, message, traceId, retryAfterSeconds } = body as Record<string, unknown>;
-    if (typeof code === 'string' && typeof message === 'string' && typeof traceId === 'string') {
-      return {
-        kind: 'alert',
-        message,
-        traceId,
-        retryAfterSeconds: typeof retryAfterSeconds === 'number' && Number.isSafeInteger(retryAfterSeconds)
-          && retryAfterSeconds > 0 ? retryAfterSeconds : undefined,
-      };
-    }
-  }
-  return { kind: 'alert', message: fallback };
-}
-
-async function apiRequest(
-  path: string,
-  signal: AbortSignal,
-  write?: { method: 'POST' | 'PATCH'; input: Record<string, string> },
-): Promise<ApiResult> {
-  try {
-    const response = await fetch(`/api/${path}`, {
-      signal,
-      credentials: 'same-origin',
-      cache: 'no-store',
-      ...(write && {
-        method: write.method,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(write.input),
-      }),
-    });
-    const body: unknown = response.status === 204 ? null : await response.json().catch(() => null);
-    return { status: response.status, body };
-  } catch {
-    return { status: 0, body: null };
-  }
-}
-
-function NoticeBox({ notice }: { notice: Notice }) {
-  return (
-    <div className={`notice ${notice.kind}`} role={notice.kind}>
-      <p>{notice.message}</p>
-      {notice.retryAfterSeconds && <p>請等候 {notice.retryAfterSeconds} 秒後再試。</p>}
-      {notice.traceId && <p className="trace">追蹤識別 {notice.traceId}</p>}
-    </div>
-  );
+function confirmedSession({ status, body, sessionTag }: ApiResult): ConfirmedSession | null {
+  return status === 200 && sessionTag && isIdentity(body) ? { identity: body, sessionTag } : null;
 }
 
 type Brand = { id: string; name: string };
@@ -110,12 +60,15 @@ function isBrandPage(value: unknown): value is BrandPage {
     && 'items' in value && Array.isArray(value.items) && value.items.every(isBrand);
 }
 
-function Brands({ isGroupAdmin, active, onAccessDenied }: {
-  isGroupAdmin: boolean;
+function Brands({ identity, active, onAccessDenied, sessionInterrupted }: {
+  identity: Identity;
   active: boolean;
   onAccessDenied: () => void;
+  sessionInterrupted: () => boolean;
 }) {
   const [page, setPage] = useState(1);
+  const [pointsBrandId, setPointsBrandId] = useState<string | null>(null);
+  const [pointsDenial, setPointsDenial] = useState<Notice | null>(null);
   const [list, setList] = useState<BrandPage | null>(null);
   const [activity, setActivity] = useState<'loading' | 'saving' | null>('loading');
   const [listFailure, setListFailure] = useState<{ page: number; notice: Notice } | null>(null);
@@ -125,7 +78,13 @@ function Brands({ isGroupAdmin, active, onAccessDenied }: {
   const request = useRef<AbortController | null>(null);
   const title = useRef<HTMLHeadingElement>(null);
 
-  const canWrite = isGroupAdmin;
+  const canWrite = identity.role === 'GROUP_ADMIN';
+  const pointsBrand = list?.items.find(({ id }) => id === pointsBrandId);
+  const denyPointsAccess = useCallback((notice: Notice) => {
+    setPointsBrandId(null);
+    setPointsDenial(notice);
+    onAccessDenied();
+  }, [onAccessDenied]);
   const writeLocked = activity !== null || !!writeNotice?.review;
 
   const loadPage = useCallback(async (target: number, signal: AbortSignal) => {
@@ -173,7 +132,10 @@ function Brands({ isGroupAdmin, active, onAccessDenied }: {
   }, [loadPage, run]);
 
   function browse(target: number) {
-    if (active) void run('loading', (signal) => loadPage(target, signal));
+    if (active) void run('loading', (signal) => {
+      if (target !== page) setPointsBrandId(null);
+      return loadPage(target, signal);
+    });
   }
 
   function save(event: FormEvent<HTMLFormElement>, current?: Brand) {
@@ -267,16 +229,22 @@ function Brands({ isGroupAdmin, active, onAccessDenied }: {
             {list.items.map((brand) => (
               <li key={brand.id}>
                 <span>{brand.name}</span>
+                <span className="brand-id">品牌 ID {brand.id}</span>
+                <button type="button" aria-label={`查看點數：${brand.name}（品牌 ID ${brand.id}）`}
+                  aria-expanded={pointsBrandId === brand.id}
+                  aria-controls={pointsBrandId === brand.id ? 'brand-points' : undefined}
+                  onClick={() => {
+                    if (sessionInterrupted()) return;
+                    setPointsDenial(null);
+                    setPointsBrandId((current) => current === brand.id ? null : brand.id);
+                  }}>查看點數</button>
                 {canWrite && (
-                  <>
-                    <span className="brand-id">品牌 ID {brand.id}</span>
-                    <button type="button" aria-label={`改名：${brand.name}（品牌 ID ${brand.id}）`}
-                      aria-disabled={writeLocked || !!edit} onClick={() => {
-                        if (!active || writeLocked || request.current || edit) return;
-                        setWriteNotice(null);
-                        setEdit({ brand, name: brand.name });
-                      }}>改名</button>
-                  </>
+                  <button type="button" aria-label={`改名：${brand.name}（品牌 ID ${brand.id}）`}
+                    aria-disabled={writeLocked || !!edit} onClick={() => {
+                      if (!active || writeLocked || request.current || edit) return;
+                      setWriteNotice(null);
+                      setEdit({ brand, name: brand.name });
+                    }}>改名</button>
                 )}
               </li>
             ))}
@@ -312,13 +280,18 @@ function Brands({ isGroupAdmin, active, onAccessDenied }: {
           </div>
         </form>
       )}
+      {pointsDenial && <NoticeBox notice={pointsDenial} />}
+      {pointsBrand && (
+        <Points key={pointsBrand.id} brand={pointsBrand} active={active} isMember={identity.role === 'MEMBER'}
+          actor={identity.username} sessionInterrupted={sessionInterrupted}
+          onAccessDenied={denyPointsAccess} />
+      )}
     </section>
   );
 }
 
 export default function Home() {
   const [session, setSession] = useState<Session>({ status: 'checking' });
-  const [sessionGeneration, setSessionGeneration] = useState(0);
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [notice, setNotice] = useState<Notice | null>(null);
   const [pending, setPending] = useState(false);
@@ -346,7 +319,7 @@ export default function Home() {
     recovery?: { anonymous: Notice; authenticated: Notice | null },
   ) => {
     // 重新確認期間隱藏品牌區塊；同一工作階段的草稿可在驗證後繼續編輯。
-    setSession((previous) => ({ status: 'checking', identity: previous.identity }));
+    setSession((previous) => ({ status: 'checking', confirmed: previous.confirmed }));
     setNotice(null);
     let revision: number;
     let result: ApiResult;
@@ -357,18 +330,19 @@ export default function Home() {
       if (signal.aborted) return;
     } while (revision !== brandDenialRevision.current);
 
+    const confirmed = confirmedSession(result);
     if (result.status === 401) {
       setSession({ status: 'anonymous' });
       setNotice(recovery?.anonymous ?? null);
       return 'anonymous';
-    } else if (result.status === 200 && isIdentity(result.body)) {
+    } else if (confirmed) {
       setPrefilledUsername('');
       setMode('login');
-      setSession({ status: 'authenticated', identity: result.body });
+      setSession({ status: 'authenticated', confirmed });
       setNotice(recovery?.authenticated ?? null);
       return 'authenticated';
     } else {
-      setSession((previous) => ({ status: 'unavailable', identity: previous.identity }));
+      setSession((previous) => ({ status: 'unavailable', confirmed: previous.confirmed }));
       setNotice({ kind: 'alert', message: '暫時無法確認登入狀態。請重新確認後再繼續。' });
     }
   }, []);
@@ -411,9 +385,8 @@ export default function Home() {
     const marker = readSessionChange();
     if (!marker || marker === observedSessionChange.current) return false;
     observedSessionChange.current = marker;
-    // 即使新工作階段屬於同一帳號，也須卸載舊品牌表單及其待處理請求。
-    setSessionGeneration((previous) => previous + 1);
-    setSession({ status: 'checking' });
+    // 跨分頁通知可能晚於身分驗證；先隱藏畫面，由伺服器確認是否需要重置草稿。
+    setSession((previous) => ({ status: 'checking', confirmed: previous.confirmed }));
     if (activeRequest.current && !activeRequest.current.checkingSession) {
       checkAfterAuth.current = true;
     } else {
@@ -421,6 +394,9 @@ export default function Home() {
     }
     return true;
   }, [refreshSession]);
+
+  const pointsSessionInterrupted = useCallback(() =>
+    observeSessionChange() || activeRequest.current !== null, [observeSessionChange]);
 
   useEffect(() => {
     observedSessionChange.current = readSessionChange();
@@ -437,7 +413,7 @@ export default function Home() {
     };
   }, [observeSessionChange, readSession, run]);
 
-  const hasIdentity = !!session.identity;
+  const hasIdentity = !!session.confirmed;
   useEffect(() => {
     if (!hasIdentity) return;
 
@@ -492,16 +468,17 @@ export default function Home() {
       setPending(false);
       observeSessionChange();
 
+      const confirmed = mode === 'login' ? confirmedSession(result) : null;
       if (mode === 'register' && result.status === 201) {
         focusHeading.current = true;
         setPrefilledUsername(username);
         setMode('login');
         setNotice({ kind: 'status', message: '會員註冊成功。請使用此帳號登入。' });
-      } else if (mode === 'login' && result.status === 200 && isIdentity(result.body)) {
+      } else if (confirmed) {
         publishSessionChange();
         focusHeading.current = true;
         setPrefilledUsername('');
-        setSession({ status: 'authenticated', identity: result.body });
+        setSession({ status: 'authenticated', confirmed });
       } else {
         const accountSwitchBlocked = result.status === 409 && result.body !== null && typeof result.body === 'object'
           && 'code' in result.body && result.body.code === 'ACCOUNT_SWITCH_REQUIRES_LOGOUT';
@@ -529,7 +506,7 @@ export default function Home() {
 
     void run(async (signal) => {
       focusHeading.current = true;
-      setSession({ status: 'checking', identity: session.identity });
+      setSession({ status: 'checking', confirmed: session.confirmed });
       setNotice(null);
       const result = await apiRequest('auth/logout', signal, { method: 'POST', input: {} });
       if (signal.aborted) return;
@@ -553,6 +530,7 @@ export default function Home() {
 
   const isRegister = mode === 'register';
   const title = session.status === 'anonymous' ? (isRegister ? '註冊會員' : '登入') : '目前身分';
+  const identity = session.confirmed?.identity;
 
   return (
     <main>
@@ -566,14 +544,14 @@ export default function Home() {
             if (!observeSessionChange()) void run(readSession, true);
           }}>重新確認</button>
         )}
-        {session.status === 'authenticated' && (
+        {session.status === 'authenticated' && identity && (
           <>
             <dl className="identity">
-              <div><dt>顯示名稱</dt><dd>{session.identity.displayName}</dd></div>
-              <div><dt>登入帳號</dt><dd>{session.identity.username}</dd></div>
-              <div><dt>角色</dt><dd>{roles[session.identity.role]}</dd></div>
-              {session.identity.role === 'MEMBER' && (
-                <div><dt>會員編號</dt><dd>{session.identity.memberNumber}</dd></div>
+              <div><dt>顯示名稱</dt><dd>{identity.displayName}</dd></div>
+              <div><dt>登入帳號</dt><dd>{identity.username}</dd></div>
+              <div><dt>角色</dt><dd>{roles[identity.role]}</dd></div>
+              {identity.role === 'MEMBER' && (
+                <div><dt>會員編號</dt><dd>{identity.memberNumber}</dd></div>
               )}
             </dl>
             <button type="button" onClick={logout}>登出</button>
@@ -607,10 +585,10 @@ export default function Home() {
           </>
         )}
       </section>
-      {session.identity && (
-        <Brands key={`${sessionGeneration}:${session.identity.username}:${session.identity.role}`}
-          isGroupAdmin={session.identity.role === 'GROUP_ADMIN'} active={session.status === 'authenticated'}
-          onAccessDenied={confirmAfterBrandDenial} />
+      {session.confirmed && (
+        <Brands key={`${session.confirmed.sessionTag}:${session.confirmed.identity.username}:${session.confirmed.identity.role}`}
+          identity={session.confirmed.identity} active={session.status === 'authenticated'}
+          onAccessDenied={confirmAfterBrandDenial} sessionInterrupted={pointsSessionInterrupted} />
       )}
     </main>
   );

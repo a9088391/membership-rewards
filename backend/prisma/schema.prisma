@@ -29,6 +29,9 @@ model Account {
   memberNumber String?   @unique @db.Uuid
   sessions     Session[]
   brandGrants  BrandAdminGrant[]
+  pointAccounts PointAccount[]
+  pointActions  PointLedger[]
+  operations    IdempotentOperation[]
 }
 
 model Brand {
@@ -37,6 +40,7 @@ model Brand {
   seedKey   String?           @unique
   createdAt DateTime          @default(now()) @db.Timestamptz(3)
   grants    BrandAdminGrant[]
+  pointAccounts PointAccount[]
 
   @@index([createdAt, id])
 }
@@ -64,4 +68,47 @@ model AttemptWindow {
   attempted DateTime[]  @db.Timestamptz(3)
 
   @@id([kind, key])
+}
+
+enum PointSource {
+  SEED
+  GRANT
+}
+
+model PointAccount {
+  brandId  String        @db.Uuid
+  memberId String        @db.Uuid
+  balance  Int           @default(0)
+  brand    Brand         @relation(fields: [brandId], references: [id], onDelete: Restrict)
+  member   Account       @relation(fields: [memberId], references: [id], onDelete: Restrict)
+  ledger   PointLedger[]
+
+  @@id([brandId, memberId])
+}
+
+model PointLedger {
+  id        String       @id @db.Uuid
+  brandId   String       @db.Uuid
+  memberId  String       @db.Uuid
+  amount    Int
+  reason    String       @db.VarChar(200)
+  source    PointSource
+  actorId   String       @db.Uuid
+  createdAt DateTime     @default(now()) @db.Timestamptz(3)
+  account   PointAccount @relation(fields: [brandId, memberId], references: [brandId, memberId], onDelete: Restrict)
+  actor     Account      @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([brandId, memberId, createdAt, id])
+}
+
+model IdempotentOperation {
+  id          String  @id @db.Uuid
+  actorId     String  @db.Uuid
+  key         String  @db.Uuid
+  fingerprint String  @db.Char(64)
+  status      Int?
+  result      Json?
+  actor       Account @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@unique([actorId, key])
 }
