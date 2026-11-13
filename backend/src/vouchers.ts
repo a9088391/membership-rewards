@@ -81,14 +81,14 @@ export function readVouchers(
       skip,
       take: pageSize + 1,
       select: {
-        id: true, code: true, brandId: true, offerId: true, createdAt: true,
+        id: true, code: true, brandId: true, offerId: true, createdAt: true, usedAt: true,
         offer: { select: { name: true, description: true, points: true, startsAt: true, endsAt: true } },
       },
     });
     const now = clock();
     return {
-      items: rows.slice(0, pageSize).map(({ offer, ...row }) => ({
-        ...row, ...offer, status: now >= offer.endsAt ? 'EXPIRED' : 'UNUSED',
+      items: rows.slice(0, pageSize).map(({ offer, usedAt, ...row }) => ({
+        ...row, ...offer, status: usedAt ? 'USED' : now >= offer.endsAt ? 'EXPIRED' : 'UNUSED',
       })),
       hasNext: rows.length > pageSize,
     };

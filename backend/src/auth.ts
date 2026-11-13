@@ -51,6 +51,7 @@ const limits = {
   [AttemptKind.LOGIN_SOURCE]: { limit: 30, windowMs: 60000 },
   [AttemptKind.LOGIN_ACCOUNT]: { limit: 5, windowMs: 600000 },
   [AttemptKind.REGISTER_SOURCE]: { limit: 5, windowMs: 600000 },
+  [AttemptKind.REDEMPTION_ACCOUNT]: { limit: 10, windowMs: 60000 },
 };
 
 export class AuthService {
@@ -90,11 +91,11 @@ export class AuthService {
     return { now, recent };
   }
 
-  async consumeSource(kind: 'LOGIN_SOURCE' | 'REGISTER_SOURCE', source: string) {
+  async consumeAttempt(kind: 'LOGIN_SOURCE' | 'REGISTER_SOURCE' | 'REDEMPTION_ACCOUNT', key: string) {
     await this.db.$transaction(async (tx) => {
-      const { now, recent } = await this.lockWindow(tx, kind, source);
+      const { now, recent } = await this.lockWindow(tx, kind, key);
       await tx.attemptWindow.update({
-        where: { kind_key: { kind, key: source } },
+        where: { kind_key: { kind, key } },
         data: { attempted: [...recent, now] },
       });
     });

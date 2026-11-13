@@ -31,6 +31,7 @@ import { createDatabase } from './database.js';
 import { Prisma, PrismaClient, Role } from './generated/client.js';
 import { createOffer, listOffers, stopOffer } from './offers.js';
 import { grantPoints, readPoints, reverseGrant } from './points.js';
+import { createRedemption, listRedemptions, readRedemption, requireRedemptionAdmin, resolveRedemption } from './redemptions.js';
 import { exchangeOffer, readVouchers } from './vouchers.js';
 
 const appClock = Symbol('appClock');
@@ -178,7 +179,7 @@ class BrandController {
 }
 
 function authenticateRequest(auth: AuthService, request: Request, response: Response, brandId?: unknown, lock = false) {
-  return async (tx: Prisma.TransactionClient) => {
+  return async (tx?: Prisma.TransactionClient) => {
     const actor = await auth.me(readSession(request), tx, lock);
     response.locals.accountId = actor.accountId;
     if (typeof brandId === 'string' && resourceIdPattern.test(brandId)) response.locals.brandId = brandId.toLowerCase();
@@ -374,12 +375,83 @@ class VouchersController {
   }
 }
 
+@Controller('api')
+class RedemptionsController {
+  constructor(
+    private readonly auth: AuthService,
+    private readonly db: PrismaClient,
+    @Inject(appClock) private readonly clock: () => Date,
+  ) {}
+
+  @Get('me/redemption-requests')
+  myRedemptions(
+    @Query('brandId') brandId: unknown,
+    @Query('page') page: unknown,
+    @Query('pageSize') pageSize: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const authenticate = authenticateRequest(this.auth, request, response);
+    return listRedemptions(this.db, authenticate, brandId, () => readPage(page, pageSize), this.clock);
+  }
+
+  @Get('redemption-requests/:requestId')
+  async redemption(
+    @Param('requestId') requestId: string,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const authenticate = authenticateRequest(this.auth, request, response);
+    const result = await readRedemption(this.db, authenticate, requestId, this.clock);
+    response.locals.requestId = result.requestId;
+    return result;
+  }
+
+  @Post('brands/:brandId/redemption-requests')
+  create(
+    @Param('brandId') brandId: string,
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const authenticate = authenticateRequest(this.auth, request, response, undefined, true);
+    return auditWrite(response, 'createRedemption', 201, async () => {
+      const result = await createRedemption(this.db, authenticate, brandId, request.header('Idempotency-Key'), body, this.clock);
+      recordRedemptionAudit(response, result);
+      return result;
+    });
+  }
+
+  @Post(['redemption-requests/:requestId/confirm', 'redemption-requests/:requestId/cancel', 'redemption-requests/:requestId/reject'])
+  resolve(
+    @Param('requestId') requestId: string,
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const action = request.path.endsWith('/confirm') ? 'confirm' : request.path.endsWith('/cancel') ? 'cancel' : 'reject';
+    const authenticate = authenticateRequest(this.auth, request, response, undefined, true);
+    return auditWrite(response, redemptionOperations[action], 201, async () => {
+      const result = await resolveRedemption(this.db, authenticate, action, requestId, request.header('Idempotency-Key'), body, this.clock);
+      recordRedemptionAudit(response, result);
+      return result;
+    });
+  }
+}
+
+function recordRedemptionAudit(response: Response, result: Prisma.JsonValue) {
+  // 稽核只採用已授權且已提交的結果識別，不記錄原始路徑或券碼。
+  if (result && typeof result === 'object' && !Array.isArray(result) && typeof result.requestId === 'string') {
+    response.locals.requestId = result.requestId;
+  }
+}
+
 @Module({})
 class ApiModule {
   static withServices(auth: AuthService, db: PrismaClient, clock: () => Date): DynamicModule {
     return {
       module: ApiModule,
-      controllers: [AuthController, BrandController, PointsController, OffersController, VouchersController],
+      controllers: [AuthController, BrandController, PointsController, OffersController, VouchersController, RedemptionsController],
       providers: [
         { provide: AuthService, useValue: auth }, { provide: PrismaClient, useValue: db }, { provide: appClock, useValue: clock },
       ],
@@ -415,10 +487,10 @@ class ErrorFilter implements ExceptionFilter {
 
 const jsonOptions = { limit: 16 * 1024, inflate: false };
 const parseJson = express.json(jsonOptions);
-const parseExchangeJson = express.json({
+const parseRequiredJson = express.json({
   ...jsonOptions,
   verify(_request, _response, body) {
-    // Express 會把零位元組的 JSON 解析成 {}，兌換仍要求明確送出空物件。
+    // Express 會把零位元組的 JSON 解析成 {}；空物件命令也須送出明確的 JSON。
     if (body.length === 0) throw invalidInput();
   },
 });
@@ -450,9 +522,12 @@ const operations = new Map([
   ['POST /api/brands', 'createBrand'],
   ['GET /api/me/vouchers', 'myVouchers'],
   ['HEAD /api/me/vouchers', 'myVouchers'],
+  ['GET /api/me/redemption-requests', 'myRedemptions'],
+  ['HEAD /api/me/redemption-requests', 'myRedemptions'],
 ]);
 
-const brandOperations: [string[], RegExp, string][] = [
+const redemptionOperations = { confirm: 'confirmRedemption', cancel: 'cancelRedemption', reject: 'rejectRedemption' };
+const resourceOperations: [string[], RegExp, string][] = [
   [['PATCH'], /^\/api\/brands\/[^/]+$/, 'renameBrand'],
   [['GET', 'HEAD'], /^\/api\/brands\/[^/]+\/me\/points$/, 'myPoints'],
   [['GET', 'HEAD'], /^\/api\/brands\/[^/]+\/me\/ledger$/, 'myLedger'],
@@ -465,11 +540,16 @@ const brandOperations: [string[], RegExp, string][] = [
   [['POST'], /^\/api\/brands\/[^/]+\/offers$/, 'createOffer'],
   [['POST'], /^\/api\/brands\/[^/]+\/offers\/[^/]+\/stop$/, 'stopOffer'],
   [['POST'], /^\/api\/brands\/[^/]+\/offers\/[^/]+\/exchanges$/, 'exchangeOffer'],
+  [['POST'], /^\/api\/brands\/[^/]+\/redemption-requests$/, 'createRedemption'],
+  [['GET', 'HEAD'], /^\/api\/redemption-requests\/[^/]+$/, 'readRedemption'],
+  [['POST'], /^\/api\/redemption-requests\/[^/]+\/confirm$/, redemptionOperations.confirm],
+  [['POST'], /^\/api\/redemption-requests\/[^/]+\/cancel$/, redemptionOperations.cancel],
+  [['POST'], /^\/api\/redemption-requests\/[^/]+\/reject$/, redemptionOperations.reject],
 ];
 
 function logApiOutcome(response: Response, operation: string, status: number) {
-  const { traceId, accountId, brandId, offerId, grantId } = response.locals;
-  console.info(JSON.stringify({ traceId, operation, status, accountId, brandId, offerId, grantId }));
+  const { traceId, accountId, brandId, offerId, grantId, requestId } = response.locals;
+  console.info(JSON.stringify({ traceId, operation, status, accountId, brandId, offerId, grantId, requestId }));
 }
 
 async function auditWrite<T>(response: Response, operation: string, status: number, write: () => Promise<T>) {
@@ -517,7 +597,7 @@ export async function createApp(options: AppOptions = {}) {
   server.use(async (request, response, next) => {
     const api = request.path === '/api' || request.path.startsWith('/api/');
     const operation = operations.get(request.method + ' ' + request.path)
-      ?? brandOperations.find(([methods, path]) => methods.includes(request.method) && path.test(request.path))?.[2]
+      ?? resourceOperations.find(([methods, path]) => methods.includes(request.method) && path.test(request.path))?.[2]
       ?? 'unknown';
     const traceId = randomUUID();
     response.locals.traceId = traceId;
@@ -548,7 +628,13 @@ export async function createApp(options: AppOptions = {}) {
         const source = request.socket.remoteAddress;
         if (!source) throw new ApiError(403, 'UNTRUSTED_HOST', '請求來源不受信任。');
         // 先提交來源計數，後續格式錯誤、帳號限流或登入失敗仍算一次。
-        await auth.consumeSource(operation === 'login' ? 'LOGIN_SOURCE' : 'REGISTER_SOURCE', source);
+        await auth.consumeAttempt(operation === 'login' ? 'LOGIN_SOURCE' : 'REGISTER_SOURCE', source);
+      }
+      if (operation === 'createRedemption') {
+        const actor = await authenticateRequest(auth, request, response)();
+        requireRedemptionAdmin(actor);
+        // 獨立提交計數；無效輸入、舊 Key 回放和業務回滾都不會略過或撤銷計數。
+        await auth.consumeAttempt('REDEMPTION_ACCOUNT', actor.accountId);
       }
       if (request.headers['content-type']?.split(';', 1)[0].trim().toLowerCase() !== 'application/json') {
         throw invalidInput();
@@ -558,7 +644,7 @@ export async function createApp(options: AppOptions = {}) {
         return;
       }
       const parseBody = operation === 'grantPoints' || operation === 'createOffer' ? parsePointsJson
-        : operation === 'exchangeOffer' ? parseExchangeJson : parseJson;
+        : operation === 'exchangeOffer' || Object.values(redemptionOperations).includes(operation) ? parseRequiredJson : parseJson;
       parseBody(request, response, (error) => {
         if (error) respondError(response, invalidInput());
         else next();

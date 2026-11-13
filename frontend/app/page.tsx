@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { Offers } from './offers';
 import { Points } from './points';
+import { Redemptions } from './redemptions';
 import { apiRequest, errorNotice, NoticeBox, type ApiResult, type Notice } from './request';
 import { Vouchers } from './vouchers';
 
@@ -49,7 +50,7 @@ function confirmedSession({ status, body, sessionTag }: ApiResult): ConfirmedSes
 
 type Brand = { id: string; name: string };
 type BrandPage = { items: Brand[]; hasNext: boolean };
-type PanelKind = 'points' | 'offers' | 'vouchers';
+type PanelKind = 'points' | 'offers' | 'vouchers' | 'redemptions';
 
 function isBrand(value: unknown): value is Brand {
   return !!value && typeof value === 'object'
@@ -83,6 +84,7 @@ function Brands({ identity, active, onAccessDenied, sessionInterrupted }: {
   const title = useRef<HTMLHeadingElement>(null);
 
   const canWrite = identity.role === 'GROUP_ADMIN';
+  const redemptionLabel = identity.role === 'MEMBER' ? '查看核銷請求' : '提出核銷';
   const selectedBrand = list?.items.find(({ id }) => id === panel?.brandId);
   const selectedOfferBrand = panel?.kind === 'offers' ? selectedBrand : undefined;
   const offerBrands = selectedOfferBrand
@@ -262,6 +264,10 @@ function Brands({ identity, active, onAccessDenied, sessionInterrupted }: {
                   aria-expanded={panel?.kind === 'vouchers' && panel.brandId === brand.id}
                   aria-controls={panel?.kind === 'vouchers' && panel.brandId === brand.id ? 'brand-vouchers' : undefined}
                   onClick={() => togglePanel('vouchers', brand.id)}>查看持有券</button>
+                <button type="button" aria-label={`${redemptionLabel}：${brand.name}（品牌 ID ${brand.id}）`}
+                  aria-expanded={panel?.kind === 'redemptions' && panel.brandId === brand.id}
+                  aria-controls={panel?.kind === 'redemptions' && panel.brandId === brand.id ? 'brand-redemptions' : undefined}
+                  onClick={() => togglePanel('redemptions', brand.id)}>{redemptionLabel}</button>
                 {canWrite && (
                   <button type="button" aria-label={`改名：${brand.name}（品牌 ID ${brand.id}）`}
                     aria-disabled={writeLocked || !!edit} onClick={() => {
@@ -318,6 +324,10 @@ function Brands({ identity, active, onAccessDenied, sessionInterrupted }: {
       {active && selectedBrand && panel?.kind === 'vouchers' && (
         <Vouchers key={selectedBrand.id} brand={selectedBrand} isMember={identity.role === 'MEMBER'}
           actor={identity.username} sessionInterrupted={sessionInterrupted} onAccessDenied={denyPanelAccess} />
+      )}
+      {selectedBrand && panel?.kind === 'redemptions' && (
+        <Redemptions key={selectedBrand.id} brand={selectedBrand} active={active} actor={identity.username}
+          memberNumber={identity.memberNumber} sessionInterrupted={sessionInterrupted} onAccessDenied={onAccessDenied} />
       )}
     </section>
   );

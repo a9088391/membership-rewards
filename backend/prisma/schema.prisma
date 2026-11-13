@@ -18,6 +18,7 @@ enum AttemptKind {
   LOGIN_SOURCE
   LOGIN_ACCOUNT
   REGISTER_SOURCE
+  REDEMPTION_ACCOUNT
 }
 
 model Account {
@@ -32,6 +33,7 @@ model Account {
   pointAccounts PointAccount[]
   pointActions  PointLedger[]
   operations    IdempotentOperation[]
+  initiatedRedemptions RedemptionRequest[]
 }
 
 model Brand {
@@ -140,12 +142,40 @@ model Voucher {
   offerId   String      @db.Uuid
   ledgerId  String      @db.Uuid
   createdAt DateTime    @db.Timestamptz(3)
+  usedAt    DateTime?   @db.Timestamptz(3)
   offer     CouponOffer @relation(fields: [brandId, offerId], references: [brandId, id], onDelete: Restrict)
   ledger    PointLedger @relation("VoucherDebit", fields: [brandId, memberId, ledgerId], references: [brandId, memberId, exchangeId], onDelete: NoAction, onUpdate: NoAction)
   requiredBy PointLedger? @relation("RequiredVoucher")
+  redemptions RedemptionRequest[]
 
   @@unique([brandId, memberId, ledgerId])
+  @@unique([brandId, memberId, id])
   @@index([memberId, createdAt, id])
+}
+
+enum RedemptionStatus {
+  PENDING
+  COMPLETED
+  CANCELLED
+  REJECTED
+  EXPIRED
+}
+
+model RedemptionRequest {
+  id          String           @id @db.Uuid
+  brandId     String           @db.Uuid
+  memberId    String           @db.Uuid
+  voucherId   String           @db.Uuid
+  initiatorId String           @db.Uuid
+  status      RedemptionStatus @default(PENDING)
+  createdAt   DateTime         @db.Timestamptz(3)
+  expiresAt   DateTime         @db.Timestamptz(3)
+  resolvedAt  DateTime?        @db.Timestamptz(3)
+  voucher     Voucher          @relation(fields: [brandId, memberId, voucherId], references: [brandId, memberId, id], onDelete: Restrict, map: "RedemptionRequest_voucher_owner_fkey")
+  initiator   Account          @relation(fields: [initiatorId], references: [id], onDelete: Restrict)
+
+  @@index([memberId, createdAt, id])
+  @@index([voucherId])
 }
 
 model IdempotentOperation {

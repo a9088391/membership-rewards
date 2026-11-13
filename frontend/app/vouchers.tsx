@@ -20,9 +20,10 @@ type Voucher = {
   startsAt: string;
   endsAt: string;
   createdAt: string;
-  status: 'UNUSED' | 'EXPIRED';
+  status: 'UNUSED' | 'USED' | 'EXPIRED';
 };
 type VoucherPage = { items: Voucher[]; hasNext: boolean };
+const voucherStatus = { UNUSED: '未使用', USED: '已核銷', EXPIRED: '已到期' } as const;
 
 function isTime(value: unknown): value is string {
   return typeof value === 'string' && Number.isFinite(Date.parse(value));
@@ -35,7 +36,8 @@ function isVoucher(value: unknown, brandId: string): value is Voucher {
   return ownerBrand === brandId && isResourceId(id) && isResourceId(code) && isResourceId(offerId)
     && typeof name === 'string' && typeof description === 'string'
     && typeof points === 'number' && Number.isInteger(points) && points > 0 && points <= 2147483647
-    && isTime(startsAt) && isTime(endsAt) && isTime(createdAt) && (status === 'UNUSED' || status === 'EXPIRED');
+    && isTime(startsAt) && isTime(endsAt) && isTime(createdAt)
+    && typeof status === 'string' && Object.hasOwn(voucherStatus, status);
 }
 
 function isVoucherPage(value: unknown, brandId: string): value is VoucherPage {
@@ -167,7 +169,7 @@ export function Vouchers({ brand, actor, isMember, sessionInterrupted, onAccessD
                   <h4>{voucher.name}</h4>
                   <p>{voucher.description}</p>
                   <dl>
-                    <div><dt>狀態</dt><dd>{voucher.status === 'UNUSED' ? '未使用' : '已到期'}</dd></div>
+                    <div><dt>狀態</dt><dd>{voucherStatus[voucher.status]}</dd></div>
                     <div><dt>券碼</dt><dd>{voucher.code}</dd></div>
                     <div><dt>兌換點數</dt><dd>{voucher.points.toLocaleString('zh-TW')}</dd></div>
                     <div><dt>開始時間</dt><dd><time dateTime={voucher.startsAt}>{voucherTime.format(new Date(voucher.startsAt))}</time></dd></div>
