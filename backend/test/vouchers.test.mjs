@@ -16,6 +16,7 @@ const { createApp } = await import('../dist/app.js');
 const { createDatabase } = await import('../dist/database.js');
 const { AuthService } = await import('../dist/auth.js');
 const { stopOffer } = await import('../dist/offers.js');
+const { reverseGrant } = await import('../dist/points.js');
 const { exchangeOffer, readVouchers } = await import('../dist/vouchers.js');
 const headers = { Host: new URL(origin).host, Origin: origin };
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
@@ -111,12 +112,15 @@ function operationKey() {
 const brandPath = (brand = brandId) => '/api/brands/' + brand;
 const memberPath = (brand = brandId, number = memberNumber) => brandPath(brand) + '/members/' + number;
 const exchangePath = (offerId, brand = brandId) => brandPath(brand) + '/offers/' + offerId + '/exchanges';
+const reversalPath = (grantId, brand = brandId) => brandPath(brand) + '/grants/' + grantId + '/reversal';
 const ownVouchers = (brand = brandId) => '/api/me/vouchers?brandId=' + brand;
 const memberVouchers = (brand = brandId, number = memberNumber) => memberPath(brand, number) + '/vouchers';
 const read = (path, cookie = member) => http.get(path).set('Host', headers.Host).set('Cookie', cookie ?? '');
 const post = (path, cookie) => http.post(path).set(headers).set('Cookie', cookie ?? '').type('application/json');
 const exchange = (offerId, key = operationKey(), cookie = member, brand = brandId) =>
   post(exchangePath(offerId, brand), cookie).set('Idempotency-Key', key);
+const reverse = (grantId, key = operationKey(), cookie = admin, brand = brandId) =>
+  post(reversalPath(grantId, brand), cookie).set('Idempotency-Key', key);
 
 async function createOffer(brand = brandId, body = terms) {
   return (await post(brandPath(brand) + '/offers', admin).send(body).expect(201)).body.id;
@@ -159,6 +163,152 @@ function expectError(response, code) {
   expect(response.headers['x-trace-id']).toBe(response.body.traceId);
   expect(response.headers['cache-control']).toBe('private, no-store');
 }
+
+test('兌換後不足以整筆撤回，補點後舊 Key 仍拒絕，新 Key 可撤回且不改原流水與持有券', async () => {
+  const { grantId } = await grant(100);
+  const offerId = await createOffer(brandId, { ...terms, points: 40 });
+  await exchange(offerId).send({}).expect(201);
+  const ledgerPath = brandPath() + '/me/ledger';
+  const before = (await read(ledgerPath).expect(200)).body;
+  const vouchers = (await read(ownVouchers()).expect(200)).body;
+  expect(before.balance).toBe(60);
+  expect(vouchers.items).toHaveLength(1);
+  expect(before.items).toEqual(expect.arrayContaining([
+    expect.objectContaining({ id: grantId, amount: 100, source: 'GRANT' }),
+    expect.objectContaining({ amount: -40, source: 'EXCHANGE' }),
+  ]));
+
+  const reason = '撤回錯誤加點';
+  const key = operationKey();
+  const first = await reverse(grantId, key).send({ reason }).expect(409);
+  expectError(first, 'INSUFFICIENT_POINTS');
+  expect((await read(ledgerPath).expect(200)).body).toEqual(before);
+  expect((await read(ownVouchers()).expect(200)).body).toEqual(vouchers);
+
+  await grant(40);
+  const replenished = (await read(ledgerPath).expect(200)).body;
+  expect(replenished.balance).toBe(100);
+  const replay = await reverse(grantId, key).send({ reason }).expect(409);
+  expectError(replay, 'INSUFFICIENT_POINTS');
+  expect(replay.body.message).toBe(first.body.message);
+  expect((await read(ledgerPath).expect(200)).body).toEqual(replenished);
+
+  const { body: result } = await reverse(grantId).send({ reason }).expect(201);
+  expect(result).toEqual({ operationId: expect.stringMatching(uuid), reversalId: expect.stringMatching(uuid), balance: 0 });
+  const after = (await read(ledgerPath).expect(200)).body;
+  expect(after).toMatchObject({ balance: 0, hasNext: false });
+  expect(after.items.filter(({ id }) => id !== result.reversalId)).toEqual(replenished.items);
+  expect(after.items.find(({ id }) => id === result.reversalId)).toEqual({
+    id: result.reversalId, amount: -100, source: 'REVERSAL', reason, reversalOfId: grantId,
+    createdAt: expect.any(String), actorDisplayName: '集團管理員',
+  });
+  expect(after.items.reduce((sum, { amount }) => sum + amount, 0)).toBe(0);
+  expect((await read(memberPath() + '/ledger', admin).expect(200)).body).toEqual(after);
+  expect((await read(ownVouchers()).expect(200)).body).toEqual(vouchers);
+  expectError(await reverse(grantId).send({ reason }).expect(409), 'ALREADY_REVERSED');
+  expect((await read(ledgerPath).expect(200)).body).toEqual(after);
+});
+
+test('撤回拒絕非法欄位、Unicode、Key 與 Origin，相同 Key 可用於合法原因', async () => {
+  const { grantId } = await grant(100);
+  const key = operationKey();
+  const valid = { reason: '撤回測試加點' };
+  const ledgerPath = brandPath() + '/me/ledger';
+  const before = (await read(ledgerPath).expect(200)).body;
+  for (const body of [
+    {}, { ...valid, points: 40 }, { ...valid, amount: 100 }, [], { reason: 20 }, { reason: null },
+    { reason: '　 ' }, { reason: '😀'.repeat(201) },
+  ]) {
+    expectError(await reverse(grantId, key).send(body).expect(400), 'INVALID_INPUT');
+  }
+  for (const reason of ['前\u0000後', '前\uD800後']) {
+    const raw = JSON.stringify({ reason });
+    expect(JSON.parse(raw).reason).toBe(reason);
+    expectError(await reverse(grantId, key).send(raw).expect(400), 'INVALID_INPUT');
+  }
+  expectError(await reverse(grantId, key).send(' '.repeat(16 * 1024) + JSON.stringify(valid)).expect(400), 'INVALID_INPUT');
+  expectError(await post(reversalPath(grantId), admin).send(valid).expect(400), 'INVALID_INPUT');
+  expectError(await reverse(grantId, 'bad-key').send(valid).expect(400), 'INVALID_INPUT');
+  expectError(await reverse(grantId, key).unset('Origin').send(valid).expect(403), 'INVALID_ORIGIN');
+  expectError(await reverse(grantId, key).set('Origin', 'http://other.localhost:18442').send(valid).expect(403), 'INVALID_ORIGIN');
+  expectError(await reverse(grantId, key).type('text/plain').send(JSON.stringify(valid)).expect(400), 'INVALID_INPUT');
+  expect(await db.idempotentOperation.count({ where: { key } })).toBe(0);
+  expect((await read(ledgerPath).expect(200)).body).toEqual(before);
+
+  const reason = '😀'.repeat(200);
+  const result = (await reverse(grantId, key).send({ reason: '　' + reason + ' ' }).expect(201)).body;
+  expect((await reverse(grantId.toUpperCase(), key.toUpperCase(), admin, brandId.toUpperCase())
+    .send({ reason }).expect(201)).body).toEqual(result);
+  expect((await read(ledgerPath).expect(200)).body.items.find(({ id }) => id === result.reversalId)).toMatchObject({
+    amount: -100, reason, reversalOfId: grantId,
+  });
+});
+
+test('不同管理員可撤回原加點，跨品牌與非人工來源一律不可見，回放查證當下角色與授權', async () => {
+  const actor = await registerMember();
+  await db.account.update({
+    where: { id: actor.id }, data: { role: 'BRAND_ADMIN', memberNumber: null, displayName: '撤回管理員' },
+  });
+  const access = { brandId, accountId: actor.id };
+  const grantKey = operationKey();
+  const { body: original } = await post(memberPath() + '/grants', admin).set('Idempotency-Key', grantKey)
+    .send({ points: 100, reason: '原人工加點' }).expect(201);
+  const { grantId: otherGrant } = await grant(60);
+  const otherBrand = await createBrand();
+  const { grantId: otherBrandGrant } = await grant(100, otherBrand);
+  const offerId = await createOffer(brandId, { ...terms, points: 40 });
+  await exchange(offerId).send({}).expect(201);
+  const seed = await db.pointLedger.findFirstOrThrow({ where: { source: 'SEED', memberId } });
+  const ledgerPath = brandPath() + '/me/ledger';
+  const before = (await read(ledgerPath).expect(200)).body;
+  const { id: exchangeId } = before.items.find(({ source }) => source === 'EXCHANGE');
+  const key = operationKey();
+  const body = { reason: '帳務更正' };
+
+  expectError(await reverse(original.grantId, key, null).send(body).expect(401), 'UNAUTHENTICATED');
+  expectError(await reverse(original.grantId, key, member).send(body).expect(403), 'FORBIDDEN');
+  expectError(await reverse(original.grantId, key, actor.cookie).send(body).expect(404), 'NOT_FOUND');
+  await db.brandAdminGrant.create({ data: access });
+  expectError(await reverse(original.grantId, key, actor.cookie)
+    .set('X-Membership-Actor', 'group_admin').send(body).expect(403), 'FORBIDDEN');
+  expectError(await reverse(otherBrandGrant, key, actor.cookie, otherBrand).send(body).expect(404), 'NOT_FOUND');
+  expectError(await reverse(otherBrandGrant, key, actor.cookie).send(body).expect(404), 'NOT_FOUND');
+  expectError(await reverse(randomUUID(), key, actor.cookie).send(body).expect(404), 'NOT_FOUND');
+  expectError(await reverse('bad-grant-id', key, actor.cookie).send(body).expect(404), 'NOT_FOUND');
+  expectError(await reverse(exchangeId, key, actor.cookie).send(body).expect(404), 'NOT_FOUND');
+  expectError(await reverse(seed.id, key, admin, seed.brandId).send(body).expect(404), 'NOT_FOUND');
+  expect(await db.idempotentOperation.count({ where: { key } })).toBe(0);
+  expect((await read(ledgerPath).expect(200)).body).toEqual(before);
+
+  expectError(await reverse(original.grantId, grantKey, admin).send(body).expect(409), 'IDEMPOTENCY_CONFLICT');
+  const { body: result } = await reverse(original.grantId, key, actor.cookie).send(body).expect(201);
+  const ledger = (await read(ledgerPath).expect(200)).body;
+  expect(ledger.balance).toBe(20);
+  expect(ledger.items.filter(({ id }) => id !== result.reversalId)).toEqual(before.items);
+  expect(ledger.items.find(({ id }) => id === result.reversalId)).toMatchObject({
+    amount: -100, actorDisplayName: '撤回管理員', reason: body.reason, reversalOfId: original.grantId,
+  });
+  expect(await db.pointLedger.findUnique({ where: { id: result.reversalId }, select: { actorId: true } }))
+    .toEqual({ actorId: actor.id });
+  expect((await read(memberPath() + '/ledger', actor.cookie).expect(200)).body).toEqual(ledger);
+  expectError(await reverse(result.reversalId, key, actor.cookie).send(body).expect(404), 'NOT_FOUND');
+  expectError(await reverse(otherGrant, key, actor.cookie).send(body).expect(409), 'IDEMPOTENCY_CONFLICT');
+  expectError(await reverse(original.grantId, key, actor.cookie).send({ reason: '改原因' }).expect(409), 'IDEMPOTENCY_CONFLICT');
+  expectError(await post(memberPath() + '/grants', actor.cookie).set('Idempotency-Key', key)
+    .send({ points: 100, ...body }).expect(409), 'IDEMPOTENCY_CONFLICT');
+
+  await db.brandAdminGrant.delete({ where: { accountId_brandId: access } });
+  expectError(await reverse(original.grantId, key, actor.cookie).send(body).expect(404), 'NOT_FOUND');
+  expectError(await read(memberPath() + '/ledger', actor.cookie).expect(404), 'NOT_FOUND');
+  await db.brandAdminGrant.create({ data: access });
+  await db.account.update({ where: { id: actor.id }, data: { role: 'MEMBER', memberNumber: actor.number } });
+  expectError(await reverse(original.grantId, key, actor.cookie).send(body).expect(403), 'FORBIDDEN');
+  await db.account.update({ where: { id: actor.id }, data: { role: 'BRAND_ADMIN', memberNumber: null } });
+  expect((await reverse(original.grantId, key, actor.cookie).send(body).expect(201)).body).toEqual(result);
+  await post('/api/auth/logout', actor.cookie).send({}).expect(204);
+  expectError(await reverse(original.grantId, key, actor.cookie).send(body).expect(401), 'UNAUTHENTICATED');
+  expect((await read(ledgerPath).expect(200)).body).toEqual(ledger);
+});
 
 async function expectExchangeState(balance, debits, voucherIds) {
   const ledger = (await read(brandPath() + '/me/ledger').expect(200)).body;
@@ -255,6 +405,48 @@ test('已提交的持有券與兌換流水不能被單獨刪除、改連結或�
 
   expect((await db.voucher.findUniqueOrThrow({ where: voucher })).ledgerId).toBe(ledgerId);
   await expectExchangeState(20, [-80], [voucherId]);
+});
+
+test('資料庫拒絕重複、跨帳戶或不存在的撤回連結，以及錯誤的撤回來源或符號', async () => {
+  const { grantId } = await grant(100);
+  const otherBrand = await createBrand();
+  const otherMember = await registerMember();
+  const { grantId: otherBrandGrant } = await grant(100, otherBrand);
+  const { grantId: otherMemberGrant } = await grant(100, brandId, otherMember.number);
+  await reverse(grantId).send({ reason: '更正重複加點' }).expect(201);
+  const ledgerPath = brandPath() + '/me/ledger';
+  const before = (await read(ledgerPath).expect(200)).body;
+  const { accountId: actorId } = await db.$transaction(authenticate(admin));
+  const sourceCheck = 'PointLedger_reversal_check';
+  const scopedLink = 'PointLedger_brandId_memberId_reversalOfId_fkey';
+  // Prisma 原生查詢包裝轉接器錯誤，SQLSTATE 與原始約束名稱留在 cause。
+  const postgresError = (originalCode, constraint) => ({
+    code: 'P2010',
+    meta: { driverAdapterError: { cause: { originalCode, originalMessage: expect.stringContaining(constraint) } } },
+  });
+  for (const [source, amount, target, code, constraint] of [
+    ['REVERSAL', -100, grantId, '23505', 'PointLedger_brandId_memberId_reversalOfId_key'],
+    ['REVERSAL', -100, otherBrandGrant, '23503', scopedLink],
+    ['REVERSAL', -100, otherMemberGrant, '23503', scopedLink],
+    ['REVERSAL', -100, randomUUID(), '23503', scopedLink],
+    ['REVERSAL', -100, null, '23514', sourceCheck],
+    ['REVERSAL', 100, grantId, '23514', sourceCheck],
+    ['GRANT', 100, grantId, '23514', sourceCheck],
+  ]) {
+    await expect(db.$transaction(async (tx) => {
+      await tx.$executeRaw`
+        INSERT INTO "PointLedger" ("id", "brandId", "memberId", "actorId", "source", "amount", "reason", "reversalOfId")
+        VALUES (${randomUUID()}::uuid, ${brandId}::uuid, ${memberId}::uuid, ${actorId}::uuid,
+                ${source}::"PointSource", ${amount}::integer, '測試約束', ${target}::uuid)
+      `;
+      throw new Error('測試撤回流水未被資料庫拒絕');
+    })).rejects.toMatchObject(postgresError(code, constraint));
+  }
+  await expect(db.$transaction(async (tx) => {
+    await tx.$executeRaw`DELETE FROM "PointLedger" WHERE "id" = ${grantId}::uuid`;
+    throw new Error('測試原流水刪除未被資料庫拒絕');
+  })).rejects.toMatchObject(postgresError('23503', scopedLink));
+  expect((await read(ledgerPath).expect(200)).body).toEqual(before);
 });
 
 test('同方案能重複獨立兌換，分頁穩定且會員與管理員只讀得授權範圍', async () => {
@@ -468,6 +660,89 @@ function runExchange(offerId, key = operationKey()) {
   return exchangeOffer(db, authenticate(member, true), { brandId, offerId }, key, {}, () => now);
 }
 
+function runReversal(grantId, key, reason) {
+  return reverseGrant(db, authenticate(admin, true), { brandId, grantId }, key, { reason });
+}
+
+test.each([false, true])('帳戶鎖下並行撤回至多一次（相同 Key：%s）', async (sameKey) => {
+  const { grantId } = await grant(100);
+  const reason = '更正重複加點';
+  const firstKey = operationKey();
+  const keys = [firstKey, sameKey ? firstKey : operationKey()];
+  const release = await holdAccount();
+  const requests = Promise.allSettled(keys.map((key) => runReversal(grantId, key, reason)));
+  try {
+    // 不同 Key 都等帳戶。同 Key 的後到者在冪等鍵等結果，尚未進入帳務。
+    expect(await waiters(accountLock, sameKey ? 1 : 2)).toBe(true);
+    if (sameKey) expect(await waiters(keyLock, 1)).toBe(true);
+  } finally {
+    await release();
+    await requests;
+  }
+  const results = await requests;
+  expect(results.map(({ status }) => status).sort()).toEqual(['fulfilled', sameKey ? 'fulfilled' : 'rejected']);
+  const result = results.find(({ status }) => status === 'fulfilled').value;
+  expect(result).toEqual({ operationId: expect.stringMatching(uuid), reversalId: expect.stringMatching(uuid), balance: 0 });
+  for (const [index, outcome] of results.entries()) {
+    const replay = reverse(grantId, keys[index]).send({ reason });
+    if (outcome.status === 'fulfilled') {
+      expect(outcome.value).toEqual(result);
+      expect((await replay.expect(201)).body).toEqual(result);
+    } else {
+      expect(outcome.reason).toMatchObject({ status: 409, code: 'ALREADY_REVERSED' });
+      expectError(await replay.expect(409), 'ALREADY_REVERSED');
+    }
+  }
+  const ledger = (await read(brandPath() + '/me/ledger').expect(200)).body;
+  expect(ledger.balance).toBe(0);
+  expect(ledger.items).toHaveLength(2);
+  expect(ledger.items.filter(({ source }) => source === 'REVERSAL')).toEqual([
+    expect.objectContaining({ id: result.reversalId, reversalOfId: grantId, amount: -100 }),
+  ]);
+  expect(ledger.items.reduce((sum, { amount }) => sum + amount, 0)).toBe(0);
+});
+
+test.each([false, true])('撤回與兌換使用同一帳戶鎖（撤回在先：%s）', async (reversalFirst) => {
+  const { grantId } = await grant(100);
+  const offerId = await createOffer(brandId, { ...terms, points: 40 });
+  const exchangeKey = operationKey();
+  const reversalKey = operationKey();
+  const reason = '更正重複加點';
+  const release = await holdAccount();
+  const calls = {
+    exchange: () => runExchange(offerId, exchangeKey),
+    reversal: () => runReversal(grantId, reversalKey, reason),
+  };
+  const order = reversalFirst ? ['reversal', 'exchange'] : ['exchange', 'reversal'];
+  const requests = [];
+  try {
+    // 等先行操作到達帳戶鎖後才加入另一筆，確認兩個命令依序判斷同一餘額。
+    requests.push(Promise.allSettled([calls[order[0]]()]));
+    expect(await waiters(accountLock, 1)).toBe(true);
+    requests.push(Promise.allSettled([calls[order[1]]()]));
+    expect(await waiters(accountLock, 2)).toBe(true);
+  } finally {
+    await release();
+    await Promise.all(requests);
+  }
+  const [first, second] = (await Promise.all(requests)).flat();
+  expect(first.status).toBe('fulfilled');
+  expect(second).toMatchObject({ status: 'rejected', reason: { code: 'INSUFFICIENT_POINTS' } });
+  const ledger = (await read(brandPath() + '/me/ledger').expect(200)).body;
+  expect(ledger.balance).toBe(reversalFirst ? 0 : 60);
+  expect(ledger.items).toHaveLength(2);
+  expect(ledger.items.reduce((sum, { amount }) => sum + amount, 0)).toBe(ledger.balance);
+  if (reversalFirst) {
+    expect((await reverse(grantId, reversalKey).send({ reason }).expect(201)).body).toEqual(first.value);
+    expectError(await exchange(offerId, exchangeKey).send({}).expect(409), 'INSUFFICIENT_POINTS');
+    await expectExchangeState(0, [], []);
+  } else {
+    expect((await exchange(offerId, exchangeKey).send({}).expect(201)).body).toEqual(first.value);
+    expectError(await reverse(grantId, reversalKey).send({ reason }).expect(409), 'INSUFFICIENT_POINTS');
+    await expectExchangeState(60, [-40], [first.value.voucherId]);
+  }
+});
+
 test.each([1, 2, 3])('不同 Key 並行兌換各 80 點，餘額 100 只允許一筆成功（第 %i 輪）', async () => {
   const offerId = await createOffer();
   await grant(100);
@@ -620,6 +895,83 @@ test('提交時故障回滾扣點、流水、持有券與操作結果，移除�
   const retried = (await exchange(offerId, key).send({}).expect(201)).body;
   expect((await exchange(offerId, key).send({}).expect(201)).body).toEqual(retried);
   await expectExchangeState(20, [-80], [retried.voucherId]);
+});
+
+test('撤回在提交時故障，餘額、流水與冪等紀錄一同回滾，原 Key 可重試', async () => {
+  const { grantId } = await grant(100);
+  const key = operationKey();
+  const reason = '更正重複加點';
+  const ledgerPath = brandPath() + '/me/ledger';
+  const before = (await read(ledgerPath).expect(200)).body;
+  await db.$executeRaw`
+    CREATE FUNCTION reversal_test_fail_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      RAISE EXCEPTION 'test-only deferred reversal failure';
+    END;
+    $$
+  `;
+  try {
+    // 延後至提交才觸發，此時餘額、反向流水與冪等結果已在同一交易中寫入。
+    await db.$executeRaw`
+      CREATE CONSTRAINT TRIGGER reversal_test_fail_commit AFTER INSERT ON "PointLedger"
+      DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW."source" = 'REVERSAL')
+      EXECUTE FUNCTION reversal_test_fail_commit()
+    `;
+    await expect(runReversal(grantId, key, reason)).rejects.toMatchObject({ status: 503, code: 'SERVICE_UNAVAILABLE' });
+    expect(await db.idempotentOperation.count({ where: { key } })).toBe(0);
+    expect((await read(ledgerPath).expect(200)).body).toEqual(before);
+    expectError(await reverse(grantId, key).send({ reason }).expect(503), 'SERVICE_UNAVAILABLE');
+    expect(await db.idempotentOperation.count({ where: { key } })).toBe(0);
+    expect((await read(ledgerPath).expect(200)).body).toEqual(before);
+  } finally {
+    await db.$executeRaw`DROP TRIGGER IF EXISTS reversal_test_fail_commit ON "PointLedger"`;
+    await db.$executeRaw`DROP FUNCTION reversal_test_fail_commit()`;
+  }
+  const result = (await reverse(grantId, key).send({ reason }).expect(201)).body;
+  expect((await reverse(grantId, key).send({ reason }).expect(201)).body).toEqual(result);
+  expect(await db.idempotentOperation.count({ where: { key } })).toBe(1);
+  const after = (await read(ledgerPath).expect(200)).body;
+  expect(after).toMatchObject({ balance: 0, hasNext: false });
+  expect(after.items.filter(({ id }) => id !== result.reversalId)).toEqual(before.items);
+  expect(after.items.find(({ id }) => id === result.reversalId)).toMatchObject({ amount: -100, reversalOfId: grantId });
+  expect(after.items.reduce((sum, { amount }) => sum + amount, 0)).toBe(0);
+});
+
+test('撤回提交後回應中斷，沿用原 Key 讀回同一筆且稽核只記一次', async () => {
+  const { grantId } = await grant(100);
+  const key = operationKey();
+  const reason = '更正重複加點';
+  const server = app.getHttpServer();
+  const closedBeforeSend = Promise.withResolvers();
+  const loseResponse = (_request, response) => {
+    // 等正常 HTTP 路徑取得已提交結果並嘗試送出 201，再關閉連線。
+    response.end = function () {
+      closedBeforeSend.resolve({
+        status: this.statusCode, traceId: this.getHeader('X-Trace-Id'), headersSent: this.headersSent,
+      });
+      return this.destroy();
+    };
+  };
+  server.prependOnceListener('request', loseResponse);
+  try {
+    await expect(reverse(grantId, key).send({ reason })).rejects.toMatchObject({ code: 'ECONNRESET' });
+  } finally {
+    server.removeListener('request', loseResponse);
+  }
+  const interrupted = await Promise.race([closedBeforeSend.promise, delay(1000, null, { ref: false })]);
+  expect(interrupted).toEqual({ status: 201, traceId: expect.stringMatching(uuid), headersSent: false });
+  const ledgerPath = brandPath() + '/me/ledger';
+  const beforeReplay = (await read(ledgerPath).expect(200)).body;
+  const reversals = beforeReplay.items.filter(({ source }) => source === 'REVERSAL');
+  expect(reversals).toEqual([expect.objectContaining({ amount: -100, reversalOfId: grantId, reason })]);
+  expect(beforeReplay.items.reduce((sum, { amount }) => sum + amount, 0)).toBe(0);
+  const result = (await reverse(grantId, key).send({ reason }).expect(201)).body;
+  expect(result).toEqual({ operationId: expect.stringMatching(uuid), reversalId: reversals[0].id, balance: 0 });
+  expect((await read(ledgerPath).expect(200)).body).toEqual(beforeReplay);
+  const { accountId } = await db.$transaction(authenticate(admin));
+  expect(logs.mock.calls.map(([line]) => JSON.parse(line)).filter(({ traceId }) => traceId === interrupted.traceId)).toEqual([{
+    traceId: interrupted.traceId, operation: 'reverseGrant', status: 201, accountId, brandId, grantId,
+  }]);
 });
 
 test('已提交但回應在送出前中斷，原 Key 回放同一券且稽核不含券碼或登入憑證', async () => {

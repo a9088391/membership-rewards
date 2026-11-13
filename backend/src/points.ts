@@ -62,10 +62,13 @@ export function readPoints(db: PrismaClient, authenticate: Authenticate, target:
       skip,
       take: pageSize + 1,
       select: {
-        id: true, amount: true, reason: true, source: true, createdAt: true, actor: { select: { displayName: true } },
+        id: true, amount: true, reason: true, source: true, createdAt: true, reversalOfId: true,
+        actor: { select: { displayName: true } },
       },
     });
-    const items = rows.slice(0, pageSize).map(({ actor, ...row }) => ({ ...row, actorDisplayName: actor.displayName }));
+    const items = rows.slice(0, pageSize).map(({ actor, reversalOfId, ...row }) => ({
+      ...row, actorDisplayName: actor.displayName, ...(reversalOfId === null ? {} : { reversalOfId }),
+    }));
     return { balance, items, hasNext: rows.length > pageSize };
   }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead });
 }
@@ -93,7 +96,7 @@ export async function findLockedPointBalance(tx: Transaction, { brandId, memberI
 export async function appendPointMovement(
   tx: Transaction,
   account: PointAccount,
-  movement: { actorId: string; amount: number; reason: string | null; source: PointSource },
+  movement: { actorId: string; amount: number; reason: string | null; source: PointSource; reversalOfId?: string },
   balance: number,
   createdAt = new Date(),
 ) {
@@ -103,13 +106,11 @@ export async function appendPointMovement(
   });
 }
 
-function readGrant(key: string | undefined, body: unknown) {
-  const operationKey = readOperationKey(key);
-  const { points, reason } = readBody(body, ['points', 'reason']);
-  if (!isPositivePoints(points) || typeof reason !== 'string' || !reason.isWellFormed()) throw invalidInput();
+function readPointReason(reason: unknown) {
+  if (typeof reason !== 'string' || !reason.isWellFormed()) throw invalidInput();
   const normalized = reason.trim();
   if (normalized.length === 0 || [...normalized].length > 200 || /\p{Cc}/u.test(normalized)) throw invalidInput();
-  return { key: operationKey, points, reason: normalized };
+  return normalized;
 }
 
 const balanceLimit = { code: 'BALANCE_LIMIT_EXCEEDED', message: '加點後的餘額會超過上限。' };
@@ -123,7 +124,10 @@ export function grantPoints(
   return runIdempotent(db, '加點', async (tx) => {
     const actor = await authenticate(tx);
     const { account } = await pointSubject(tx, actor, target, true);
-    const { key, points, reason } = readGrant(keyInput, body);
+    const key = readOperationKey(keyInput);
+    const { points, reason: inputReason } = readBody(body, ['points', 'reason']);
+    if (!isPositivePoints(points)) throw invalidInput();
+    const reason = readPointReason(inputReason);
     const { accountId: actorId } = actor;
     return {
       actorId, key, content: ['GRANT', account.brandId, account.memberId, points, reason],
@@ -134,6 +138,56 @@ export function grantPoints(
           tx, account, { actorId, amount: points, reason, source: PointSource.GRANT }, balance,
         );
         return { status: 201, result: { operationId, grantId, balance } };
+      },
+    };
+  });
+}
+
+const alreadyReversed = { code: 'ALREADY_REVERSED', message: '這筆加點已撤回。' };
+const insufficient = { code: 'INSUFFICIENT_POINTS', message: '此品牌的可用點數不足。' };
+
+export function reverseGrant(
+  db: PrismaClient,
+  authenticate: Authenticate,
+  target: { brandId: string; grantId: string },
+  keyInput: string | undefined,
+  body: unknown,
+) {
+  return runIdempotent(db, '撤回加點', async (tx) => {
+    const actor = await authenticate(tx);
+    if (actor.identity.role === Role.MEMBER) throw forbidden();
+    if (!resourceIdPattern.test(target.brandId)) throw invalidInput();
+    const brandId = await requireBrand(tx, actor, target.brandId, true);
+    if (!resourceIdPattern.test(target.grantId)) throw missingResource();
+    const key = readOperationKey(keyInput);
+    const reason = readPointReason(readBody(body, ['reason']).reason);
+    const grantId = target.grantId.toLowerCase();
+    const where = { id: grantId, brandId, source: PointSource.GRANT };
+
+    // 回放前僅查可見的原人工加點及其固定帳戶，保留帳務判斷至冪等檢查後。
+    const locator = await tx.pointLedger.findUnique({ where, select: { memberId: true } });
+    if (!locator) throw missingResource();
+    const account = { brandId, memberId: locator.memberId };
+    const { accountId: actorId } = actor;
+    return {
+      actorId, key, content: ['REVERSAL', brandId, grantId, reason],
+      async execute(operationId) {
+        // 在同一帳戶鎖下重讀原流水和撤回狀態，已撤回優先於餘額不足。
+        const currentBalance = await findLockedPointBalance(tx, account);
+        if (currentBalance === null) throw missingResource();
+        const original = await tx.pointLedger.findUnique({
+          where: { ...where, memberId: account.memberId },
+          select: { amount: true, reversal: { select: { id: true } } },
+        });
+        if (!original || !isPositivePoints(original.amount)) throw missingResource();
+        if (original.reversal) return { status: 409, result: alreadyReversed };
+        if (currentBalance < original.amount) return { status: 409, result: insufficient };
+
+        const balance = currentBalance - original.amount;
+        const { id: reversalId } = await appendPointMovement(tx, account, {
+          actorId, amount: -original.amount, reason, source: PointSource.REVERSAL, reversalOfId: grantId,
+        }, balance);
+        return { status: 201, result: { operationId, reversalId, balance } };
       },
     };
   });

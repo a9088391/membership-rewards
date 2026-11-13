@@ -92,6 +92,7 @@ enum PointSource {
   SEED
   GRANT
   EXCHANGE
+  REVERSAL
 }
 
 model PointAccount {
@@ -121,7 +122,13 @@ model PointLedger {
   voucher    Voucher?   @relation("VoucherDebit")
   requiredVoucher Voucher? @relation("RequiredVoucher", fields: [brandId, memberId, exchangeId], references: [brandId, memberId, ledgerId], onDelete: NoAction, onUpdate: NoAction)
 
+  reversalOfId String?      @db.Uuid
+  reversalOf   PointLedger? @relation("GrantReversal", fields: [brandId, memberId, reversalOfId], references: [brandId, memberId, id], onDelete: NoAction, onUpdate: NoAction)
+  reversal     PointLedger? @relation("GrantReversal")
+
   @@unique([brandId, memberId, exchangeId])
+  @@unique([brandId, memberId, id])
+  @@unique([brandId, memberId, reversalOfId])
   @@index([brandId, memberId, createdAt, id])
 }
 

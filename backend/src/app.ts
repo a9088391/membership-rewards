@@ -30,7 +30,7 @@ import { resourceIdPattern } from './brand-access.js';
 import { createDatabase } from './database.js';
 import { Prisma, PrismaClient, Role } from './generated/client.js';
 import { createOffer, listOffers, stopOffer } from './offers.js';
-import { grantPoints, readPoints } from './points.js';
+import { grantPoints, readPoints, reverseGrant } from './points.js';
 import { exchangeOffer, readVouchers } from './vouchers.js';
 
 const appClock = Symbol('appClock');
@@ -252,6 +252,21 @@ class PointsController {
       this.db, authenticate, { brandId, memberNumber }, request.header('Idempotency-Key'), body,
     ));
   }
+
+  @Post('grants/:grantId/reversal')
+  reverse(
+    @Param('brandId') brandId: string,
+    @Param('grantId') grantId: string,
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const authenticate = authenticateRequest(this.auth, request, response, brandId, true);
+    if (resourceIdPattern.test(grantId)) response.locals.grantId = grantId.toLowerCase();
+    return auditWrite(response, 'reverseGrant', 201, () => reverseGrant(
+      this.db, authenticate, { brandId, grantId }, request.header('Idempotency-Key'), body,
+    ));
+  }
 }
 
 @Controller('api/brands/:brandId/offers')
@@ -445,6 +460,7 @@ const brandOperations: [string[], RegExp, string][] = [
   [['GET', 'HEAD'], /^\/api\/brands\/[^/]+\/members\/[^/]+\/ledger$/, 'memberLedger'],
   [['GET', 'HEAD'], /^\/api\/brands\/[^/]+\/members\/[^/]+\/vouchers$/, 'memberVouchers'],
   [['POST'], /^\/api\/brands\/[^/]+\/members\/[^/]+\/grants$/, 'grantPoints'],
+  [['POST'], /^\/api\/brands\/[^/]+\/grants\/[^/]+\/reversal$/, 'reverseGrant'],
   [['GET', 'HEAD'], /^\/api\/brands\/[^/]+\/offers$/, 'listOffers'],
   [['POST'], /^\/api\/brands\/[^/]+\/offers$/, 'createOffer'],
   [['POST'], /^\/api\/brands\/[^/]+\/offers\/[^/]+\/stop$/, 'stopOffer'],
@@ -452,8 +468,8 @@ const brandOperations: [string[], RegExp, string][] = [
 ];
 
 function logApiOutcome(response: Response, operation: string, status: number) {
-  const { traceId, accountId, brandId, offerId } = response.locals;
-  console.info(JSON.stringify({ traceId, operation, status, accountId, brandId, offerId }));
+  const { traceId, accountId, brandId, offerId, grantId } = response.locals;
+  console.info(JSON.stringify({ traceId, operation, status, accountId, brandId, offerId, grantId }));
 }
 
 async function auditWrite<T>(response: Response, operation: string, status: number, write: () => Promise<T>) {
