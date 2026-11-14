@@ -51,5 +51,11 @@ services:
 
 volumes:
   postgres:
+    labels:
+      io.membership-rewards.checkout: ${PWD}
   app-secrets:
+    labels:
+      io.membership-rewards.checkout: ${PWD}
   db-secrets:
+    labels:
+      io.membership-rewards.checkout: ${PWD}
