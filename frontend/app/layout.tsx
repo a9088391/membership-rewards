@@ -8,7 +8,6 @@ export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="zh-Hant-TW">
       <body>
-        <header className="site-header">會員平台</header>
         {children}
       </body>
     </html>

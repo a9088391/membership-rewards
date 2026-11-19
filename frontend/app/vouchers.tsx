@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { RefreshIcon } from './icons';
 import { apiRequest, errorNotice, isResourceId, NoticeBox, type Notice } from './request';
 
 const voucherTime = new Intl.DateTimeFormat('zh-TW', {
@@ -9,7 +10,7 @@ const maxTimeout = 2_147_483_647;
 const minRefreshDelay = 1000;
 const missingDateRefreshDelay = 5000;
 
-type Voucher = {
+type VoucherDto = {
   id: string;
   code: string;
   brandId: string;
@@ -22,17 +23,17 @@ type Voucher = {
   createdAt: string;
   status: 'UNUSED' | 'USED' | 'EXPIRED';
 };
-type VoucherPage = { items: Voucher[]; hasNext: boolean };
+type VoucherPageDto = { items: VoucherDto[]; hasNext: boolean };
 const voucherStatus = { UNUSED: '未使用', USED: '已核銷', EXPIRED: '已到期' } as const;
 
 function isTime(value: unknown): value is string {
   return typeof value === 'string' && Number.isFinite(Date.parse(value));
 }
 
-function isVoucher(value: unknown, brandId: string): value is Voucher {
+function isVoucherDto(value: unknown, brandId: string): value is VoucherDto {
   if (!value || typeof value !== 'object') return false;
   const { id, code, brandId: ownerBrand, offerId, name, description, points, startsAt, endsAt, createdAt, status }
-    = value as Partial<Voucher>;
+    = value as Partial<VoucherDto>;
   return ownerBrand === brandId && isResourceId(id) && isResourceId(code) && isResourceId(offerId)
     && typeof name === 'string' && typeof description === 'string'
     && typeof points === 'number' && Number.isInteger(points) && points > 0 && points <= 2147483647
@@ -40,10 +41,10 @@ function isVoucher(value: unknown, brandId: string): value is Voucher {
     && typeof status === 'string' && Object.hasOwn(voucherStatus, status);
 }
 
-function isVoucherPage(value: unknown, brandId: string): value is VoucherPage {
+function isVoucherPageDto(value: unknown, brandId: string): value is VoucherPageDto {
   return !!value && typeof value === 'object'
     && 'hasNext' in value && typeof value.hasNext === 'boolean'
-    && 'items' in value && Array.isArray(value.items) && value.items.every((item) => isVoucher(item, brandId));
+    && 'items' in value && Array.isArray(value.items) && value.items.every((item) => isVoucherDto(item, brandId));
 }
 
 export function Vouchers({ brand, actor, isMember, sessionInterrupted, onAccessDenied }: {
@@ -55,7 +56,7 @@ export function Vouchers({ brand, actor, isMember, sessionInterrupted, onAccessD
 }) {
   const [search, setSearch] = useState('');
   const [target, setTarget] = useState<string | null>(null);
-  const [list, setList] = useState<{ page: number; data: VoucherPage; readAt: number; serverTime?: number } | null>(null);
+  const [list, setList] = useState<{ page: number; data: VoucherPageDto; readAt: number; serverTime?: number } | null>(null);
   const [loading, setLoading] = useState(isMember);
   const [notice, setNotice] = useState<Notice | null>(null);
   const request = useRef<AbortController | null>(null);
@@ -93,7 +94,7 @@ export function Vouchers({ brand, actor, isMember, sessionInterrupted, onAccessD
     request.current = null;
     setLoading(false);
     if (sessionInterrupted()) return;
-    if (result.status === 200 && isVoucherPage(result.body, brand.id)) {
+    if (result.status === 200 && isVoucherPageDto(result.body, brand.id)) {
       setList({ page, data: result.body, readAt: performance.now(), serverTime: result.serverTime });
     } else {
       const failure = errorNotice(result, '暫時無法讀取持有券。');
@@ -165,21 +166,25 @@ export function Vouchers({ brand, actor, isMember, sessionInterrupted, onAccessD
           {list.data.items.length ? (
             <ul className="brand-list offers-list">
               {list.data.items.map((voucher) => (
-                <li key={voucher.id}>
-                  <h4>{voucher.name}</h4>
+                <li className="voucher-card" key={voucher.id}>
+                  <div className="ticket-heading"><h4>{voucher.name}</h4><span className="status-badge">{voucherStatus[voucher.status]}</span></div>
                   <p>{voucher.description}</p>
                   <dl>
-                    <div><dt>狀態</dt><dd>{voucherStatus[voucher.status]}</dd></div>
-                    <div><dt>券碼</dt><dd>{voucher.code}</dd></div>
                     <div><dt>兌換點數</dt><dd>{voucher.points.toLocaleString('zh-TW')}</dd></div>
                     <div><dt>開始時間</dt><dd><time dateTime={voucher.startsAt}>{voucherTime.format(new Date(voucher.startsAt))}</time></dd></div>
                     <div><dt>截止時間</dt><dd><time dateTime={voucher.endsAt}>{voucherTime.format(new Date(voucher.endsAt))}</time></dd></div>
                     <div><dt>取得時間</dt><dd><time dateTime={voucher.createdAt}>{voucherTime.format(new Date(voucher.createdAt))}</time></dd></div>
                   </dl>
+                  <p className="code-label">完整券碼</p><code className="voucher-code">{voucher.code}</code>
+                  <p className="hint">提供券碼給管理員後，請到核銷請求確認使用。</p>
+                  <details className="id-details"><summary>識別資訊</summary>
+                    <p className="brand-id">持有券 ID {voucher.id}</p><p className="brand-id">方案 ID {voucher.offerId}</p>
+                  </details>
                 </li>
               ))}
             </ul>
           ) : <p>此頁沒有持有券。</p>}
+          <p className="page-count">本頁 {list.data.items.length} 筆</p>
           {(list.page > 1 || list.data.hasNext) && (
             <nav className="brand-actions" aria-label="持有券分頁">
               <button type="button" disabled={list.page === 1} onClick={() => void load(list.page - 1, target)}>上一頁</button>
@@ -191,7 +196,7 @@ export function Vouchers({ brand, actor, isMember, sessionInterrupted, onAccessD
       )}
       {(isMember || target) && (
         <div className="brand-actions">
-          <button type="button" aria-disabled={loading} onClick={() => void load(1, target)}>重新讀取持有券</button>
+          <button type="button" aria-disabled={loading} onClick={() => void load(1, target)}><RefreshIcon />重新讀取持有券</button>
         </div>
       )}
     </section>

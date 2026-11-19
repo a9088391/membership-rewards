@@ -1,26 +1,12 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
-import { Offers } from './offers';
-import { Points } from './points';
-import { Redemptions } from './redemptions';
+import { Brands } from './brands';
+import { BrandIcon } from './icons';
+import { isIdentityDto, roleLabels, type IdentityDto } from './identity';
 import { apiRequest, errorNotice, NoticeBox, type ApiResult, type Notice } from './request';
-import { Vouchers } from './vouchers';
 
-const roles = {
-  MEMBER: '會員',
-  GROUP_ADMIN: '集團管理員',
-  BRAND_ADMIN: '品牌管理員',
-} as const;
-
-type Identity = {
-  username: string;
-  displayName: string;
-  role: keyof typeof roles;
-  memberNumber: string | null;
-};
-
-type ConfirmedSession = { identity: Identity; sessionTag: string };
+type ConfirmedSession = { identity: IdentityDto; sessionTag: string };
 type Session =
   | { status: 'checking' | 'unavailable'; confirmed?: ConfirmedSession }
   | { status: 'anonymous'; confirmed?: never }
@@ -36,301 +22,8 @@ function readSessionChange() {
   }
 }
 
-function isIdentity(body: unknown): body is Identity {
-  if (!body || typeof body !== 'object') return false;
-  const { username, displayName, role, memberNumber } = body as Partial<Identity>;
-  return typeof username === 'string' && typeof displayName === 'string'
-    && typeof role === 'string' && Object.hasOwn(roles, role)
-    && (role === 'MEMBER' ? typeof memberNumber === 'string' : memberNumber === null);
-}
-
 function confirmedSession({ status, body, sessionTag }: ApiResult): ConfirmedSession | null {
-  return status === 200 && sessionTag && isIdentity(body) ? { identity: body, sessionTag } : null;
-}
-
-type Brand = { id: string; name: string };
-type BrandPage = { items: Brand[]; hasNext: boolean };
-type PanelKind = 'points' | 'offers' | 'vouchers' | 'redemptions';
-
-function isBrand(value: unknown): value is Brand {
-  return !!value && typeof value === 'object'
-    && 'id' in value && typeof value.id === 'string'
-    && 'name' in value && typeof value.name === 'string';
-}
-
-function isBrandPage(value: unknown): value is BrandPage {
-  return !!value && typeof value === 'object'
-    && 'hasNext' in value && typeof value.hasNext === 'boolean'
-    && 'items' in value && Array.isArray(value.items) && value.items.every(isBrand);
-}
-
-function Brands({ identity, active, onAccessDenied, sessionInterrupted }: {
-  identity: Identity;
-  active: boolean;
-  onAccessDenied: () => void;
-  sessionInterrupted: () => boolean;
-}) {
-  const [page, setPage] = useState(1);
-  const [panel, setPanel] = useState<{ kind: PanelKind; brandId: string } | null>(null);
-  const [retainedOfferBrands, setRetainedOfferBrands] = useState<Brand[]>([]);
-  const [panelDenial, setPanelDenial] = useState<Notice | null>(null);
-  const [list, setList] = useState<BrandPage | null>(null);
-  const [activity, setActivity] = useState<'loading' | 'saving' | null>('loading');
-  const [listFailure, setListFailure] = useState<{ page: number; notice: Notice } | null>(null);
-  const [writeNotice, setWriteNotice] = useState<(Notice & { review?: 'required' | 'read' }) | null>(null);
-  const [createName, setCreateName] = useState('');
-  const [edit, setEdit] = useState<{ brand: Brand; name: string } | null>(null);
-  const request = useRef<AbortController | null>(null);
-  const title = useRef<HTMLHeadingElement>(null);
-
-  const canWrite = identity.role === 'GROUP_ADMIN';
-  const redemptionLabel = identity.role === 'MEMBER' ? '查看核銷請求' : '提出核銷';
-  const selectedBrand = list?.items.find(({ id }) => id === panel?.brandId);
-  const selectedOfferBrand = panel?.kind === 'offers' ? selectedBrand : undefined;
-  const offerBrands = selectedOfferBrand
-    ? [...retainedOfferBrands.filter(({ id }) => id !== selectedOfferBrand.id), selectedOfferBrand]
-    : retainedOfferBrands;
-
-  // 切換面板只保留仍在處理或待確認的寫入，各品牌沿用原元件。
-  function retainOfferBrand(brand: Brand, retain: boolean) {
-    setRetainedOfferBrands((previous) => retain ? [...previous, brand] : previous.filter(({ id }) => id !== brand.id));
-  }
-
-  const denyPanelAccess = useCallback((notice: Notice) => {
-    setPanel(null);
-    setPanelDenial(notice);
-    onAccessDenied();
-  }, [onAccessDenied]);
-  const writeLocked = activity !== null || !!writeNotice?.review;
-
-  const loadPage = useCallback(async (target: number, signal: AbortSignal) => {
-    setListFailure(null);
-    const result = await apiRequest(`brands?page=${target}`, signal);
-    if (signal.aborted) return;
-    if (result.status === 200 && isBrandPage(result.body)) {
-      setPage(target);
-      setList(result.body);
-      setWriteNotice((previous) => previous?.review ? { ...previous, review: 'read' } : previous);
-    } else {
-      setListFailure({ page: target, notice: errorNotice(result, '暫時無法讀取品牌清單。') });
-      setWriteNotice((previous) => previous?.review === 'read' ? { ...previous, review: 'required' } : previous);
-      if (result.status === 401 || result.status === 403) {
-        setList(null);
-        onAccessDenied();
-      }
-    }
-  }, [onAccessDenied]);
-
-  const run = useCallback(async (
-    next: 'loading' | 'saving',
-    work: (signal: AbortSignal) => Promise<void>,
-  ) => {
-    if (request.current) return;
-    const controller = new AbortController();
-    request.current = controller;
-    setActivity(next);
-    try {
-      await work(controller.signal);
-    } finally {
-      if (request.current === controller) {
-        request.current = null;
-        setActivity(null);
-      }
-    }
-  }, []);
-
-  useEffect(() => {
-    void run('loading', (signal) => loadPage(1, signal));
-    return () => {
-      request.current?.abort();
-      request.current = null;
-    };
-  }, [loadPage, run]);
-
-  function browse(target: number) {
-    if (active) void run('loading', (signal) => {
-      if (target !== page) setPanel(null);
-      return loadPage(target, signal);
-    });
-  }
-
-  function togglePanel(kind: PanelKind, brandId: string) {
-    if (!active || sessionInterrupted()) return;
-    setPanelDenial(null);
-    setPanel((current) => current?.kind === kind && current.brandId === brandId ? null : { kind, brandId });
-  }
-
-  function save(event: FormEvent<HTMLFormElement>, current?: Brand) {
-    event.preventDefault();
-    if (!active || !canWrite || writeLocked || request.current) return;
-
-    const name = current ? edit?.name : createName;
-    if (name === undefined) return;
-
-    void run('saving', async (signal) => {
-      setWriteNotice(null);
-      const result = await apiRequest(current ? `brands/${encodeURIComponent(current.id)}` : 'brands', signal, {
-        method: current ? 'PATCH' : 'POST',
-        input: { name },
-      });
-      if (signal.aborted) return;
-
-      if (result.status === (current ? 200 : 201) && isBrand(result.body)
-        && (!current || result.body.id === current.id)) {
-        setWriteNotice({ kind: 'status', message: current ? `已改名為「${result.body.name}」。` : `已新增「${result.body.name}」。` });
-        if (current) {
-          title.current?.focus();
-          setEdit(null);
-        } else {
-          setCreateName('');
-        }
-        setActivity('loading');
-        await loadPage(page, signal);
-      } else if (result.status === 401 || result.status === 403) {
-        setWriteNotice(errorNotice(result, '目前無法管理品牌。'));
-        onAccessDenied();
-      } else if (result.status === 400) {
-        setWriteNotice(errorNotice(result, '無法儲存品牌名稱。'));
-      } else if (current && result.status === 404) {
-        setWriteNotice(errorNotice(result, '找不到要改名的品牌。'));
-        title.current?.focus();
-        setEdit(null);
-        setActivity('loading');
-        await loadPage(page, signal);
-      } else {
-        const failure = errorNotice(result, '');
-        setWriteNotice({
-          kind: 'alert',
-          message: '無法確認這次寫入的結果。請重新讀取品牌清單並查看相關頁面，再決定是否發起新的操作。',
-          traceId: failure.traceId,
-          review: 'required',
-        });
-      }
-    });
-  }
-
-  return (
-    <section className="auth-card brands-card" aria-labelledby="brands-title" hidden={!active}>
-      <h2 id="brands-title" ref={title} tabIndex={-1}>品牌清單</h2>
-      {writeNotice && <NoticeBox notice={writeNotice} />}
-      {writeNotice?.review && (
-        <div className="brand-actions">
-          <button type="button" aria-disabled={activity !== null}
-            onClick={() => browse(listFailure?.page ?? page)}>重新讀取品牌清單</button>
-          {canWrite && writeNotice.review === 'read' && (
-            <button type="button" aria-disabled={activity !== null} onClick={() => {
-              if (!active || request.current) return;
-              title.current?.focus();
-              setWriteNotice(null);
-            }}>已檢查清單，允許新的操作</button>
-          )}
-        </div>
-      )}
-      {canWrite && (
-        <form className="brand-form" method="post" onSubmit={(event) => save(event)}>
-          <label htmlFor="brand-name">新品牌名稱</label>
-          <input id="brand-name" name="name" required value={createName} readOnly={writeLocked}
-            onChange={(event) => setCreateName(event.target.value)} aria-describedby="brand-name-hint" />
-          <p id="brand-name-hint" className="hint">去除首尾空白後須為 1 至 80 個字元。</p>
-          <button type="submit" aria-disabled={writeLocked}>新增品牌</button>
-        </form>
-      )}
-      {activity && <p role="status">{activity === 'loading' ? '讀取品牌清單中…' : '儲存品牌中…'}</p>}
-      {listFailure && (
-        <>
-          <NoticeBox notice={listFailure.notice} />
-          {!writeNotice?.review && (
-            <button type="button" onClick={() => browse(listFailure.page)}>重新讀取品牌清單</button>
-          )}
-        </>
-      )}
-      {list && (
-        <>
-          {list.items.length === 0 && <p>此頁沒有品牌。</p>}
-          <ul className="brand-list">
-            {list.items.map((brand) => (
-              <li key={brand.id}>
-                <span>{brand.name}</span>
-                <span className="brand-id">品牌 ID {brand.id}</span>
-                <button type="button" aria-label={`查看點數：${brand.name}（品牌 ID ${brand.id}）`}
-                  aria-expanded={panel?.kind === 'points' && panel.brandId === brand.id}
-                  aria-controls={panel?.kind === 'points' && panel.brandId === brand.id ? 'brand-points' : undefined}
-                  onClick={() => togglePanel('points', brand.id)}>查看點數</button>
-                <button type="button" aria-label={`查看優惠券方案：${brand.name}（品牌 ID ${brand.id}）`}
-                  aria-expanded={panel?.kind === 'offers' && panel.brandId === brand.id}
-                  aria-controls={panel?.kind === 'offers' && panel.brandId === brand.id ? 'brand-offers' : undefined}
-                  onClick={() => togglePanel('offers', brand.id)}>查看優惠券方案</button>
-                <button type="button" aria-label={`查看持有券：${brand.name}（品牌 ID ${brand.id}）`}
-                  aria-expanded={panel?.kind === 'vouchers' && panel.brandId === brand.id}
-                  aria-controls={panel?.kind === 'vouchers' && panel.brandId === brand.id ? 'brand-vouchers' : undefined}
-                  onClick={() => togglePanel('vouchers', brand.id)}>查看持有券</button>
-                <button type="button" aria-label={`${redemptionLabel}：${brand.name}（品牌 ID ${brand.id}）`}
-                  aria-expanded={panel?.kind === 'redemptions' && panel.brandId === brand.id}
-                  aria-controls={panel?.kind === 'redemptions' && panel.brandId === brand.id ? 'brand-redemptions' : undefined}
-                  onClick={() => togglePanel('redemptions', brand.id)}>{redemptionLabel}</button>
-                {canWrite && (
-                  <button type="button" aria-label={`改名：${brand.name}（品牌 ID ${brand.id}）`}
-                    aria-disabled={writeLocked || !!edit} onClick={() => {
-                      if (!active || writeLocked || request.current || edit) return;
-                      setWriteNotice(null);
-                      setEdit({ brand, name: brand.name });
-                    }}>改名</button>
-                )}
-              </li>
-            ))}
-          </ul>
-          {(page > 1 || list.hasNext) && (
-            <nav className="brand-actions" aria-label="品牌清單分頁">
-              <button type="button" disabled={page === 1} aria-disabled={activity !== null}
-                onClick={() => browse(page - 1)}>上一頁</button>
-              <p role="status">第 {page} 頁</p>
-              <button type="button" disabled={!list.hasNext} aria-disabled={activity !== null}
-                onClick={() => browse(page + 1)}>下一頁</button>
-            </nav>
-          )}
-        </>
-      )}
-      {canWrite && edit && (
-        <form className="brand-form" method="post" onSubmit={(event) => save(event, edit.brand)}>
-          <label htmlFor="rename-brand-name">修改品牌名稱</label>
-          <input id="rename-brand-name" name="name" autoFocus required value={edit.name} readOnly={writeLocked}
-            onChange={(event) => setEdit({ ...edit, name: event.target.value })} aria-describedby="rename-brand-hint" />
-          <p id="rename-brand-hint" className="hint">
-            「{edit.brand.name}」改名後須為 1 至 80 個字元。
-            <span className="brand-id">品牌 ID {edit.brand.id}</span>
-          </p>
-          <div className="brand-actions">
-            <button type="submit" aria-disabled={writeLocked}>儲存名稱</button>
-            <button type="button" aria-disabled={writeLocked} onClick={() => {
-              if (!active || writeLocked || request.current) return;
-              title.current?.focus();
-              setEdit(null);
-              setWriteNotice(null);
-            }}>取消改名</button>
-          </div>
-        </form>
-      )}
-      {panelDenial && <NoticeBox notice={panelDenial} />}
-      {selectedBrand && panel?.kind === 'points' && (
-        <Points key={selectedBrand.id} brand={selectedBrand} active={active} isMember={identity.role === 'MEMBER'}
-          actor={identity.username} sessionInterrupted={sessionInterrupted}
-          onAccessDenied={denyPanelAccess} />
-      )}
-      {offerBrands.map((brand) => (
-        <Offers key={brand.id} brand={brand} active={active && brand.id === selectedOfferBrand?.id}
-          memberNumber={identity.memberNumber} actor={identity.username} sessionInterrupted={sessionInterrupted}
-          onAccessDenied={onAccessDenied} retainBrand={retainOfferBrand} />
-      ))}
-      {active && selectedBrand && panel?.kind === 'vouchers' && (
-        <Vouchers key={selectedBrand.id} brand={selectedBrand} isMember={identity.role === 'MEMBER'}
-          actor={identity.username} sessionInterrupted={sessionInterrupted} onAccessDenied={denyPanelAccess} />
-      )}
-      {selectedBrand && panel?.kind === 'redemptions' && (
-        <Redemptions key={selectedBrand.id} brand={selectedBrand} active={active} actor={identity.username}
-          memberNumber={identity.memberNumber} sessionInterrupted={sessionInterrupted} onAccessDenied={onAccessDenied} />
-      )}
-    </section>
-  );
+  return status === 200 && sessionTag && isIdentityDto(body) ? { identity: body, sessionTag } : null;
 }
 
 export default function Home() {
@@ -572,67 +265,86 @@ export default function Home() {
   }
 
   const isRegister = mode === 'register';
-  const title = session.status === 'anonymous' ? (isRegister ? '註冊會員' : '登入') : '目前身分';
+  const title = session.status === 'anonymous' ? (isRegister ? '註冊會員' : '登入會員平台') : '目前身分';
   const identity = session.confirmed?.identity;
 
   return (
-    <main>
-      <section className="auth-card" aria-labelledby="auth-title">
-        <h1 id="auth-title" ref={heading} tabIndex={-1}>{title}</h1>
-        {notice && <NoticeBox notice={notice} />}
-        {session.status === 'checking' && <p role="status">確認登入狀態中…</p>}
-        {session.status === 'unavailable' && (
-          <button type="button" onClick={() => {
-            focusHeading.current = true;
-            if (!observeSessionChange()) void run(readSession, true);
-          }}>重新確認</button>
-        )}
-        {session.status === 'authenticated' && identity && (
-          <>
+    <>
+      <header className="site-header">
+        <div className="wordmark"><span>MEMBER <i>/</i> REWARDS</span><strong>會員平台</strong></div>
+        {session.status === 'authenticated' && identity && <div className="account-area">
+          <span className="account-name">{identity.displayName}</span><span className="role-badge">{roleLabels[identity.role]}</span>
+          <details className="account-details">
+            <summary>帳號資訊</summary>
             <dl className="identity">
               <div><dt>顯示名稱</dt><dd>{identity.displayName}</dd></div>
               <div><dt>登入帳號</dt><dd>{identity.username}</dd></div>
-              <div><dt>角色</dt><dd>{roles[identity.role]}</dd></div>
-              {identity.role === 'MEMBER' && (
-                <div><dt>會員編號</dt><dd>{identity.memberNumber}</dd></div>
-              )}
+              <div><dt>角色</dt><dd>{roleLabels[identity.role]}</dd></div>
+              {identity.role === 'MEMBER' && <div><dt>會員編號</dt><dd>{identity.memberNumber}</dd></div>}
             </dl>
-            <button type="button" onClick={logout}>登出</button>
-          </>
+          </details>
+          <button type="button" className="logout" onClick={logout}>登出</button>
+        </div>}
+      </header>
+      <main className={session.status === 'authenticated' ? 'signed-in' : 'signed-out'}>
+        <div className={session.status === 'anonymous' ? 'login-layout' : undefined}>
+          {session.status === 'anonymous' && <aside className="login-intro">
+            <h2>一個帳號，<br />累積每個品牌的日常。</h2>
+            <div className="intro-rule" />
+            <div className="intro-brands">
+              <p><BrandIcon name="咖啡" />咖啡</p>
+              <p><BrandIcon name="餐飲" />餐飲</p>
+            </div>
+            <p>各品牌點數分開累積，優惠券由原會員確認使用。</p>
+          </aside>}
+          <section className={session.status === 'authenticated' ? 'session-summary' : 'auth-card'} aria-labelledby="auth-title">
+            <h1 id="auth-title" className={session.status === 'authenticated' ? 'sr-only' : undefined} ref={heading} tabIndex={-1}>{title}</h1>
+            {session.status === 'anonymous' && <p className="auth-subtitle">會員與管理員使用同一入口。</p>}
+            {notice && <NoticeBox notice={notice} />}
+            {session.status === 'checking' && <p role="status">確認登入狀態中…</p>}
+            {session.status === 'unavailable' && (
+              <button type="button" onClick={() => {
+                focusHeading.current = true;
+                if (!observeSessionChange()) void run(readSession, true);
+              }}>重新確認</button>
+            )}
+            {session.status === 'anonymous' && (
+              <>
+                <form key={mode} method="post" onSubmit={submit}>
+                  <label htmlFor="username">登入帳號</label>
+                  <input id="username" name="username" autoComplete="username" autoCapitalize="none" spellCheck={false}
+                    defaultValue={prefilledUsername} readOnly={pending} required aria-describedby="username-hint" />
+                  <p className="hint" id="username-hint">3 至 32 個字元，可用小寫英文字母、數字及底線。</p>
+                  {isRegister && (
+                    <>
+                      <label htmlFor="display-name">顯示名稱</label>
+                      <input id="display-name" name="displayName" autoComplete="nickname" readOnly={pending} required
+                        aria-describedby="display-name-hint" />
+                      <p className="hint" id="display-name-hint">1 至 40 個字元。</p>
+                    </>
+                  )}
+                  <label htmlFor="password">密碼</label>
+                  <input id="password" name="password" type="password" autoComplete={isRegister ? 'new-password' : 'current-password'}
+                    readOnly={pending} required aria-describedby="password-hint" />
+                  <p className="hint" id="password-hint">12 至 128 個字元，保留輸入的空白。</p>
+                  <button type="submit" aria-disabled={pending}>{isRegister ? '註冊' : '登入'}</button>
+                </form>
+                {pending && <p role="status">{isRegister ? '註冊中…' : '登入中…'}</p>}
+                <button className="switch-mode" type="button" aria-disabled={pending} onClick={switchMode}>
+                  {isRegister ? '已有帳號，前往登入' : '註冊會員'}
+                </button>
+              </>
+            )}
+            {session.status === 'anonymous' && <p className="register-note">註冊僅建立會員帳號</p>}
+          </section>
+        </div>
+        {/* 工作階段與帳號共同決定工作區生命週期；同帳號重驗保留，換身分則重新建立。 */}
+        {session.confirmed && (
+          <Brands key={`${session.confirmed.sessionTag}:${session.confirmed.identity.username}:${session.confirmed.identity.role}`}
+            identity={session.confirmed.identity} active={session.status === 'authenticated'}
+            onAccessDenied={confirmAfterBrandDenial} sessionInterrupted={pointsSessionInterrupted} />
         )}
-        {session.status === 'anonymous' && (
-          <>
-            <form key={mode} method="post" onSubmit={submit}>
-              <label htmlFor="username">登入帳號</label>
-              <input id="username" name="username" autoComplete="username" autoCapitalize="none" spellCheck={false}
-                defaultValue={prefilledUsername} readOnly={pending} required aria-describedby="username-hint" />
-              <p className="hint" id="username-hint">3 至 32 個字元，可用小寫英文字母、數字及底線。</p>
-              {isRegister && (
-                <>
-                  <label htmlFor="display-name">顯示名稱</label>
-                  <input id="display-name" name="displayName" autoComplete="nickname" readOnly={pending} required
-                    aria-describedby="display-name-hint" />
-                  <p className="hint" id="display-name-hint">1 至 40 個字元。</p>
-                </>
-              )}
-              <label htmlFor="password">密碼</label>
-              <input id="password" name="password" type="password" autoComplete={isRegister ? 'new-password' : 'current-password'}
-                readOnly={pending} required aria-describedby="password-hint" />
-              <p className="hint" id="password-hint">12 至 128 個字元，保留輸入的空白。</p>
-              <button type="submit" aria-disabled={pending}>{isRegister ? '註冊' : '登入'}</button>
-            </form>
-            {pending && <p role="status">{isRegister ? '註冊中…' : '登入中…'}</p>}
-            <button className="switch-mode" type="button" aria-disabled={pending} onClick={switchMode}>
-              {isRegister ? '已有帳號，前往登入' : '註冊會員'}
-            </button>
-          </>
-        )}
-      </section>
-      {session.confirmed && (
-        <Brands key={`${session.confirmed.sessionTag}:${session.confirmed.identity.username}:${session.confirmed.identity.role}`}
-          identity={session.confirmed.identity} active={session.status === 'authenticated'}
-          onAccessDenied={confirmAfterBrandDenial} sessionInterrupted={pointsSessionInterrupted} />
-      )}
-    </main>
+      </main>
+    </>
   );
 }

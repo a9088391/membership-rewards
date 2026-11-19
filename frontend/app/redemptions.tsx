@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { RefreshIcon } from './icons';
 import { apiRequest, errorNotice, isResourceId, NoticeBox, type Notice } from './request';
 
 const statuses = {
@@ -19,7 +20,7 @@ const preKeyErrors: Record<number, string> = {
   400: 'INVALID_INPUT', 401: 'UNAUTHENTICATED', 403: 'FORBIDDEN', 404: 'NOT_FOUND', 429: 'RATE_LIMITED',
 };
 
-type RequestRow = {
+type RedemptionRequestDto = {
   requestId: string;
   brandId: string;
   brandName: string;
@@ -32,7 +33,7 @@ type RequestRow = {
   resolvedAt: string | null;
   initiatorDisplayName?: string;
 };
-type RequestPage = { items: RequestRow[]; hasNext: boolean };
+type RedemptionRequestPageDto = { items: RedemptionRequestDto[]; hasNext: boolean };
 type Resolution = 'confirm' | 'cancel' | 'reject';
 type Operation = { action: 'create'; codeDigest: string } | { action: Resolution; requestId: string };
 type Intent = Operation & { key: string };
@@ -41,16 +42,16 @@ type Submission = { action: 'create'; retryKeys?: readonly string[] }
   | { action: Resolution; requestId: string; retryKey?: string };
 type ReadQuery = { target: string | number };
 type ReadResult = { query: ReadQuery } & (
-  { notice: Notice } | { data: RequestPage; serverTime?: number; receivedAt: number }
+  { notice: Notice } | { data: RedemptionRequestPageDto; serverTime?: number; receivedAt: number }
 );
 
 function isTime(value: unknown): value is string {
   return typeof value === 'string' && Number.isFinite(Date.parse(value));
 }
 
-function isRequestRow(value: unknown, brandId: string, isMember: boolean): value is RequestRow {
+function isRedemptionRequestDto(value: unknown, brandId: string, isMember: boolean): value is RedemptionRequestDto {
   if (!value || typeof value !== 'object') return false;
-  const row = value as Partial<RequestRow>;
+  const row = value as Partial<RedemptionRequestDto>;
   return isResourceId(row.requestId) && row.brandId === brandId && typeof row.brandName === 'string'
     && isResourceId(row.voucherId) && isResourceId(row.offerId) && typeof row.offerName === 'string'
     && typeof row.status === 'string' && Object.hasOwn(statuses, row.status)
@@ -58,9 +59,9 @@ function isRequestRow(value: unknown, brandId: string, isMember: boolean): value
     && (isMember ? typeof row.initiatorDisplayName === 'string' : row.initiatorDisplayName === undefined);
 }
 
-function isRequestPage(value: unknown, brandId: string): value is RequestPage {
+function isRedemptionRequestPageDto(value: unknown, brandId: string): value is RedemptionRequestPageDto {
   return !!value && typeof value === 'object' && 'hasNext' in value && typeof value.hasNext === 'boolean'
-    && 'items' in value && Array.isArray(value.items) && value.items.every((row) => isRequestRow(row, brandId, true));
+    && 'items' in value && Array.isArray(value.items) && value.items.every((row) => isRedemptionRequestDto(row, brandId, true));
 }
 
 async function digest(value: string) {
@@ -107,20 +108,21 @@ function requestPath(id: string) {
   return `redemption-requests/${encodeURIComponent(id)}`;
 }
 
-function RequestDetails({ row }: { row: RequestRow }) {
+function RequestDetails({ row }: { row: RedemptionRequestDto }) {
   return (
     <>
-      <h4>{row.offerName}</h4>
+      <div className="ticket-heading"><h4>{row.offerName}</h4><span className="status-badge">{statuses[row.status]}</span></div>
       <dl>
-        <div><dt>狀態</dt><dd>{statuses[row.status]}</dd></div>
         <div><dt>品牌</dt><dd>{row.brandName}</dd></div>
-        <div><dt>持有券 ID</dt><dd>{row.voucherId}</dd></div>
-        <div><dt>核銷請求 ID</dt><dd>{row.requestId}</dd></div>
         {row.initiatorDisplayName !== undefined && <div><dt>發起管理員</dt><dd>{row.initiatorDisplayName}</dd></div>}
         <div><dt>提出時間</dt><dd><time dateTime={row.createdAt}>{taipeiTime.format(new Date(row.createdAt))}</time></dd></div>
         <div><dt>截止時間</dt><dd><time dateTime={row.expiresAt}>{taipeiTime.format(new Date(row.expiresAt))}</time></dd></div>
         {row.resolvedAt && <div><dt>結束時間</dt><dd><time dateTime={row.resolvedAt}>{taipeiTime.format(new Date(row.resolvedAt))}</time></dd></div>}
       </dl>
+      <details className="id-details"><summary>識別資訊</summary>
+        <p className="brand-id">持有券 ID {row.voucherId}</p>
+        <p className="brand-id">核銷請求 ID {row.requestId}</p>
+      </details>
     </>
   );
 }
@@ -217,10 +219,10 @@ export function Redemptions({ brand, active, actor, memberNumber, sessionInterru
         setReadResult({ query: currentQuery, notice: { kind: 'status', message: '請在確認登入後重新讀取核銷請求。' } });
         return;
       }
-      let data: RequestPage | undefined;
+      let data: RedemptionRequestPageDto | undefined;
       if (result.status === 200) {
-        if (typeof target === 'number' && isRequestPage(result.body, brand.id)) data = result.body;
-        if (typeof target === 'string' && isRequestRow(result.body, brand.id, isMember) && result.body.requestId === target) {
+        if (typeof target === 'number' && isRedemptionRequestPageDto(result.body, brand.id)) data = result.body;
+        if (typeof target === 'string' && isRedemptionRequestDto(result.body, brand.id, isMember) && result.body.requestId === target) {
           data = { items: [result.body], hasNext: false };
         }
       }
@@ -314,7 +316,7 @@ export function Redemptions({ brand, active, actor, memberNumber, sessionInterru
           expectedActor: actor, idempotencyKey: intent.key,
         });
         if (!isCurrent()) return;
-        const receipt = result.status === 201 && isRequestRow(result.body, brand.id, isMember)
+        const receipt = result.status === 201 && isRedemptionRequestDto(result.body, brand.id, isMember)
           && 'operationId' in result.body && isResourceId(result.body.operationId)
           && result.body.status === actions[intent.action].status
           && (intent.action === 'create' || result.body.requestId === intent.requestId) ? result.body : null;
@@ -384,7 +386,7 @@ export function Redemptions({ brand, active, actor, memberNumber, sessionInterru
   return (
     <section className="redemptions" id="brand-redemptions" aria-labelledby="redemptions-title">
       <h3 id="redemptions-title" ref={heading} tabIndex={-1}>「{brand.name}」核銷請求</h3>
-      <p className="hint">核銷請求時間以 Asia/Taipei 顯示。</p>
+      <p className="hint">{isMember ? '確認後立即完成核銷，不會再次扣點。' : '輸入會員提供的完整券碼，由原會員確認；僅限原發起管理員查詢或取消。'}時間以 Asia/Taipei 顯示。</p>
       {storage === null && <NoticeBox notice={{ kind: 'alert', message: '無法存取待確認紀錄，目前無法送出核銷操作。' }} />}
       {feedback && <NoticeBox notice={feedback} />}
       {!isMember && (
@@ -392,6 +394,7 @@ export function Redemptions({ brand, active, actor, memberNumber, sessionInterru
           event.preventDefault();
           if (canWrite) void send({ action: 'create' });
         }}>
+          <h4>提出核銷</h4>
           <label htmlFor="redemption-code">完整券碼</label>
           <input id="redemption-code" name="code" ref={codeInput} required autoComplete="off" autoCapitalize="none"
             spellCheck={false} value={code} readOnly={sending}
@@ -430,6 +433,7 @@ export function Redemptions({ brand, active, actor, memberNumber, sessionInterru
       {sending && <p role="status">送出核銷操作中…</p>}
       {!isMember && (
         <form className="brand-form" method="post" onSubmit={lookup}>
+          <h4>查詢原請求</h4>
           <label htmlFor="redemption-id">核銷請求 ID</label>
           <input id="redemption-id" name="requestId" required autoComplete="off" autoCapitalize="none"
             spellCheck={false} value={lookupId} readOnly={sending} onChange={(event) => {
@@ -454,13 +458,13 @@ export function Redemptions({ brand, active, actor, memberNumber, sessionInterru
               if (!blocked) void send({ action, requestId: row.requestId });
             };
             return (
-              <li key={row.requestId}>
+              <li className="request-card" key={row.requestId}>
                 <RequestDetails row={row} />
                 {row.status === 'PENDING' && (
                   <div className="brand-actions">
                     {isMember ? <>
-                      <button type="button" disabled={blocked} onClick={() => resolve('confirm')}>確認核銷</button>
-                      <button type="button" disabled={blocked} onClick={() => resolve('reject')}>拒絕核銷</button>
+                      <button className="primary" type="button" disabled={blocked} onClick={() => resolve('confirm')}>確認核銷</button>
+                      <button className="secondary" type="button" disabled={blocked} onClick={() => resolve('reject')}>拒絕核銷</button>
                     </> : <button type="button" disabled={blocked} onClick={() => resolve('cancel')}>取消核銷請求</button>}
                   </div>
                 )}
@@ -480,7 +484,7 @@ export function Redemptions({ brand, active, actor, memberNumber, sessionInterru
         <button type="button" disabled={sending} onClick={() => select(1)}>返回核銷請求清單</button>
       </div>}
       {target !== undefined && <div className="brand-actions">
-        <button type="button" disabled={sending} onClick={() => select(target)}>重新讀取核銷請求</button>
+        <button type="button" disabled={sending} onClick={() => select(target)}><RefreshIcon />重新讀取核銷請求</button>
       </div>}
     </section>
   );

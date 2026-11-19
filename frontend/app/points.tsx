@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type Dispatch, type FormEvent, type SetStateAction } from 'react';
+import { RefreshIcon } from './icons';
 import { apiRequest, errorNotice, isResourceId, NoticeBox, type Notice } from './request';
 
 const maxPoints = 2147483647;
@@ -6,15 +7,15 @@ const ledgerTime = new Intl.DateTimeFormat('zh-TW', {
   timeZone: 'Asia/Taipei', dateStyle: 'medium', timeStyle: 'medium', hourCycle: 'h23',
 });
 
-type Member = { memberNumber: string; displayName: string };
-type LedgerEntry = {
+type MemberDto = { memberNumber: string; displayName: string };
+type LedgerEntryDto = {
   id: string;
   amount: number;
   createdAt: string;
   actorDisplayName: string;
 } & ({ source: 'SEED' | 'GRANT'; reason: string } | { source: 'EXCHANGE'; reason: null }
   | { source: 'REVERSAL'; reason: string; reversalOfId: string });
-type Ledger = { balance: number; items: LedgerEntry[]; hasNext: boolean };
+type LedgerDto = { balance: number; items: LedgerEntryDto[]; hasNext: boolean };
 type Grant = { key: string; points: number; reason: string; grantId?: never };
 type ReversalDraft = { grantId: string; points: number; reason: string };
 type Reversal = ReversalDraft & { key: string };
@@ -39,7 +40,7 @@ function isBalance(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= maxPoints;
 }
 
-function isLedgerEntry(value: unknown): value is LedgerEntry {
+function isLedgerEntryDto(value: unknown): value is LedgerEntryDto {
   const entry = object(value);
   return !!entry && typeof entry.id === 'string' && typeof entry.amount === 'number'
     && (entry.source === 'EXCHANGE' || entry.source === 'REVERSAL'
@@ -51,10 +52,10 @@ function isLedgerEntry(value: unknown): value is LedgerEntry {
     && typeof entry.actorDisplayName === 'string';
 }
 
-function isLedger(value: unknown): value is Ledger {
+function isLedgerDto(value: unknown): value is LedgerDto {
   const result = object(value);
   return !!result && isBalance(result.balance) && typeof result.hasNext === 'boolean'
-    && Array.isArray(result.items) && result.items.every(isLedgerEntry);
+    && Array.isArray(result.items) && result.items.every(isLedgerEntryDto);
 }
 
 function isPointResult(value: unknown, operation: Operation) {
@@ -137,8 +138,8 @@ function ActivePoints({ brand, isMember, actor, sessionInterrupted, onAccessDeni
 }) {
   const { search, points, reason } = draft;
   const [restoreMemberNumber] = useState(draft.memberNumber);
-  const [member, setMember] = useState<Member | null>(null);
-  const [ledger, setLedger] = useState<{ page: number; data: Ledger } | null>(null);
+  const [member, setMember] = useState<MemberDto | null>(null);
+  const [ledger, setLedger] = useState<{ page: number; data: LedgerDto } | null>(null);
   const [activity, setActivity] = useState<'loading' | Operation | null>(null);
   const [readNotice, setReadNotice] = useState<Notice | null>(null);
   const [feedback, setFeedback] = useState<Partial<Record<Operation, Feedback>>>({});
@@ -199,7 +200,7 @@ function ActivePoints({ brand, isMember, actor, sessionInterrupted, onAccessDeni
     setReadNotice(null);
     const result = await apiRequest(`${path}/ledger?page=${page}`, signal, { expectedActor: actor });
     if (!isCurrent(signal) || version !== ledgerRead.current.version) return;
-    if (result.status === 200 && isLedger(result.body)) {
+    if (result.status === 200 && isLedgerDto(result.body)) {
       setLedger({ page, data: result.body });
       return;
     }
@@ -232,7 +233,7 @@ function ActivePoints({ brand, isMember, actor, sessionInterrupted, onAccessDeni
     }
 
     const match = { memberNumber: target.memberNumber, displayName: target.displayName };
-    const keys = await pointStorageKeys(actor, brand.id, match.memberNumber).catch(() => null);
+    const keys = await pointStorageKeys(actor, brand.id, match.memberNumber).catch (() => null);
     if (!isCurrent(signal)) return;
     ledgerRead.current.scope = keys;
     setMember(match);
@@ -479,11 +480,10 @@ function ActivePoints({ brand, isMember, actor, sessionInterrupted, onAccessDeni
   const reversedIds = new Set(pageEntries.flatMap((entry) => entry.source === 'REVERSAL' ? [entry.reversalOfId] : []));
 
   return (
-    <section className="points" id="brand-points" aria-labelledby="points-title">
-      <h3 id="points-title" ref={heading} tabIndex={-1}>「{brand.name}」點數</h3>
-      <p className="brand-id">品牌 ID {brand.id}</p>
+    <section className={`points ${isMember ? 'member-points' : 'admin-points'}`} id="brand-points" aria-labelledby="points-title">
+      <h3 className="panel-title" id="points-title" ref={heading} tabIndex={-1}>{isMember ? `${brand.name}點數` : '會員點數'}</h3>
       {!isMember && (
-        <form method="post" onSubmit={lookup}>
+        <form className="member-lookup" method="post" onSubmit={lookup}>
           <label htmlFor="points-member-number">完整會員編號</label>
           <input id="points-member-number" name="memberNumber" required autoComplete="off"
             autoCapitalize="none" spellCheck={false} value={search} readOnly={busy}
@@ -494,125 +494,155 @@ function ActivePoints({ brand, isMember, actor, sessionInterrupted, onAccessDeni
               setDraft((previous) => ({ ...previous, search: value }));
             }} />
           <button type="submit" disabled={busy}>查詢會員</button>
+          <p className="hint">僅以完整會員編號查詢，不提供會員名單。</p>
         </form>
       )}
-      {member && (
-        <dl className="identity">
-          <div><dt>會員顯示名稱</dt><dd>{member.displayName}</dd></div>
-          <div><dt>會員編號</dt><dd>{member.memberNumber}</dd></div>
-        </dl>
-      )}
+      {member && <div className="member-result">
+        <strong>{member.displayName}</strong>
+        <span className="brand-id">會員編號 {member.memberNumber}</span>
+        {ledger && <p>目前餘額 <strong>{ledger.data.balance.toLocaleString('zh-TW')}</strong> 點</p>}
+      </div>}
+      {isMember && ledger && <div className="balance-card">
+        <h4>可用點數</h4>
+        <p><strong>{ledger.data.balance.toLocaleString('zh-TW')}</strong> 點</p>
+        <p className="hint">點數不會到期</p>
+      </div>}
       {activity && <p role="status">{activity === 'loading' ? '讀取點數資料中…' : `${operationName[activity]}送出中…`}</p>}
       {readNotice && <NoticeBox notice={readNotice} />}
-      {subjectPath && (
-        <section aria-labelledby="ledger-title">
-          <h4 id="ledger-title">點數流水</h4>
-          {ledger && (
-            <>
-              <p><strong>目前餘額 {ledger.data.balance.toLocaleString('zh-TW')} 點</strong></p>
-              {pageEntries.length === 0 ? <p>目前沒有點數流水。</p> : (
-                <ol className="brand-list">
-                  {pageEntries.map((entry) => (
-                    <li key={entry.id} id={`point-entry-${entry.id}`}>
-                      <p>
-                        <strong>{entry.amount.toLocaleString('zh-TW', { signDisplay: 'always' })} 點</strong>{' '}
-                        {{ SEED: '種子點數', GRANT: '加點', EXCHANGE: '兌換', REVERSAL: '撤回加點' }[entry.source]}
-                      </p>
-                      {entry.source === 'GRANT' && <p className="brand-id">加點紀錄 ID {entry.id}</p>}
-                      {entry.source === 'REVERSAL' && <p className="brand-id">
-                        原加點紀錄 ID {originalIds.has(entry.reversalOfId)
-                          ? <a href={`#point-entry-${entry.reversalOfId}`}>{entry.reversalOfId}</a> : entry.reversalOfId}
-                      </p>}
-                      {entry.reason !== null && <p>原因 {entry.reason}</p>}
-                      <p>操作者 {entry.actorDisplayName}</p>
-                      <time dateTime={entry.createdAt}>{ledgerTime.format(new Date(entry.createdAt))}（Asia/Taipei）</time>
-                      {member && entry.source === 'GRANT' && !reversedIds.has(entry.id) && (
-                        <button type="button" disabled={busy || !canReverse || !!pendingReversal}
-                          onClick={(event) => {
-                            reversalTrigger.current = event.currentTarget;
-                            showFeedback('reversal');
-                            setReversalDraft({ grantId: entry.id, points: entry.amount, reason: '' });
-                            reversalReason.current?.focus();
-                          }}>選擇撤回</button>
-                      )}
-                    </li>
-                  ))}
-                </ol>
-              )}
-              {(ledger.page > 1 || ledger.data.hasNext) && (
-                <nav className="brand-actions" aria-label="點數流水分頁">
-                  <button type="button" disabled={busy || ledger.page === 1}
-                    onClick={() => browse(ledger.page - 1)}>上一頁</button>
-                  <p role="status">第 {ledger.page} 頁</p>
-                  <button type="button" disabled={busy || !ledger.data.hasNext}
-                    onClick={() => browse(ledger.page + 1)}>下一頁</button>
-                </nav>
-              )}
-            </>
-          )}
-          <button type="button" disabled={busy} onClick={() => browse(1)}>重新讀取流水</button>
-        </section>
-      )}
-      {member && reversalNotice && <NoticeBox notice={reversalNotice} />}
-      {member && !canReverse && !busy && <NoticeBox notice={{
-        kind: 'alert', message: '無法存取瀏覽器的待確認撤回紀錄，目前無法送出撤回。',
-      }} />}
-      {member && displayedReversal && (
-        <form method="post" noValidate autoComplete="off" aria-labelledby="reversal-title"
-          onSubmit={(event) => submitPointAction(event, 'reversal')}>
-          <h4 id="reversal-title">整筆撤回加點</h4>
-          <p>原加點 {displayedReversal.points.toLocaleString('zh-TW', { signDisplay: 'always' })} 點，將等額撤回。</p>
-          <p className="brand-id">原加點紀錄 ID {displayedReversal.grantId}</p>
-          <label htmlFor="reversal-reason">撤回原因</label>
-          <textarea id="reversal-reason" name="reason" rows={3} required ref={reversalReason}
-            readOnly={busy || !!pendingReversal} aria-describedby="reversal-reason-hint" value={displayedReversal.reason}
-            onChange={(event) => {
-              const { value } = event.currentTarget;
-              setReversalDraft((previous) => previous && { ...previous, reason: value });
-            }} />
-          <p className="hint" id="reversal-reason-hint">去除首尾空白後須為 1 至 200 個字元。</p>
-          <div className="brand-actions">
-            <button type="submit" disabled={busy || !canReverse}>
-              {pendingReversal ? '重試同一次撤回' : '確認整筆撤回'}
-            </button>
-            {!pendingReversal && <button type="button" disabled={busy} onClick={() => {
-              setReversalDraft(null);
-              showFeedback('reversal');
-              const trigger = reversalTrigger.current;
-              if (trigger?.isConnected) trigger.focus();
-              else heading.current?.focus();
-            }}>取消撤回</button>}
-          </div>
-        </form>
-      )}
-      {member && (
-        <form method="post" noValidate autoComplete="off" onSubmit={(event) => submitPointAction(event, 'grant')}>
-          <h4>為會員加點</h4>
-          {grantNotice && <NoticeBox notice={grantNotice} />}
-          {!canGrant && !busy && <NoticeBox notice={{
-            kind: 'alert', message: '無法存取瀏覽器的待確認紀錄，目前無法送出加點。',
+      <div className="points-body">
+        <div className="point-actions">
+          {member && reversalNotice && <NoticeBox notice={reversalNotice} />}
+          {member && !canReverse && !busy && <NoticeBox notice={{
+            kind: 'alert', message: '無法存取瀏覽器的待確認撤回紀錄，目前無法送出撤回。',
           }} />}
-          <label htmlFor="grant-points">加點點數</label>
-          <input id="grant-points" name="points" inputMode="numeric" required readOnly={busy || !!pending}
-            aria-describedby="grant-points-hint" value={pending?.points ?? points}
-            onChange={(event) => {
-              const { value } = event.currentTarget;
-              setDraft((previous) => ({ ...previous, points: value }));
-            }} />
-          <p className="hint" id="grant-points-hint">請輸入 1 至 2,147,483,647 的整數。</p>
-          <label htmlFor="grant-reason">加點原因</label>
-          <textarea id="grant-reason" name="reason" rows={3} required readOnly={busy || !!pending}
-            aria-describedby="grant-reason-hint" value={pending?.reason ?? reason}
-            onChange={(event) => {
-              const { value } = event.currentTarget;
-              setDraft((previous) => ({ ...previous, reason: value }));
-            }} />
-          <p className="hint" id="grant-reason-hint">去除首尾空白後須為 1 至 200 個字元。</p>
-          <button type="submit" disabled={busy || !canGrant}>
-            {pending ? '重試同一次加點' : '加點'}
-          </button>
-        </form>
-      )}
+          {member && displayedReversal && (
+            <form className="reversal-form" method="post" noValidate autoComplete="off" aria-labelledby="reversal-title"
+              onSubmit={(event) => submitPointAction(event, 'reversal')}>
+              <h4 id="reversal-title">整筆撤回加點</h4>
+              <p>原加點 {displayedReversal.points.toLocaleString('zh-TW', { signDisplay: 'always' })} 點，將等額撤回。</p>
+              <p className="brand-id">原加點紀錄 ID {displayedReversal.grantId}</p>
+              <label htmlFor="reversal-reason">撤回原因</label>
+              <textarea id="reversal-reason" name="reason" rows={3} required ref={reversalReason} autoFocus={!pendingReversal}
+                readOnly={busy || !!pendingReversal} aria-describedby="reversal-reason-hint" value={displayedReversal.reason}
+                onChange={(event) => {
+                  const { value } = event.currentTarget;
+                  setReversalDraft((previous) => previous && { ...previous, reason: value });
+                }} />
+              <p className="hint" id="reversal-reason-hint">去除首尾空白後須為 1 至 200 個字元。</p>
+              <div className="brand-actions">
+                <button type="submit" disabled={busy || !canReverse}>
+                  {pendingReversal ? '重試同一次撤回' : '確認整筆撤回'}
+                </button>
+                {!pendingReversal && <button type="button" disabled={busy} onClick={() => {
+                  setReversalDraft(null);
+                  showFeedback('reversal');
+                  const trigger = reversalTrigger.current;
+                  if (trigger?.isConnected) trigger.focus();
+                  else heading.current?.focus();
+                }}>取消撤回</button>}
+              </div>
+            </form>
+          )}
+          {member && (
+            <form className="grant-form" method="post" noValidate autoComplete="off" onSubmit={(event) => submitPointAction(event, 'grant')}>
+              <h4>為會員加點</h4>
+              {grantNotice && <NoticeBox notice={grantNotice} />}
+              {!canGrant && !busy && <NoticeBox notice={{
+                kind: 'alert', message: '無法存取瀏覽器的待確認紀錄，目前無法送出加點。',
+              }} />}
+              <label htmlFor="grant-points">加點點數</label>
+              <input id="grant-points" name="points" inputMode="numeric" required readOnly={busy || !!pending}
+                aria-describedby="grant-points-hint" value={pending?.points ?? points}
+                onChange={(event) => {
+                  const { value } = event.currentTarget;
+                  setDraft((previous) => ({ ...previous, points: value }));
+                }} />
+              <p className="hint" id="grant-points-hint">請輸入 1 至 2,147,483,647 的整數。</p>
+              <label htmlFor="grant-reason">加點原因</label>
+              <textarea id="grant-reason" name="reason" rows={3} required readOnly={busy || !!pending}
+                aria-describedby="grant-reason-hint" value={pending?.reason ?? reason}
+                onChange={(event) => {
+                  const { value } = event.currentTarget;
+                  setDraft((previous) => ({ ...previous, reason: value }));
+                }} />
+              <p className="hint" id="grant-reason-hint">去除首尾空白後須為 1 至 200 個字元。</p>
+              <button type="submit" disabled={busy || !canGrant}>
+                {pending ? '重試同一次加點' : '加點'}
+              </button>
+            </form>
+          )}
+        </div>
+        {subjectPath && (
+          <section className="ledger-panel" aria-labelledby="ledger-title">
+            <div className="section-heading">
+              <h4 id="ledger-title">點數流水</h4>
+              <button className="secondary" type="button" disabled={busy} onClick={() => browse(1)}><RefreshIcon />重新讀取流水</button>
+            </div>
+            {ledger && (
+              <>
+                {pageEntries.length === 0 ? <p>目前沒有點數流水。</p> : (
+                  <table className="ledger-table">
+                    <caption className="sr-only">點數異動紀錄，時間以 Asia/Taipei 顯示</caption>
+                    <thead>
+                      <tr>
+                        <th scope="col">時間（Asia/Taipei）</th>
+                        <th scope="col">異動</th>
+                        <th scope="col">類型</th>
+                        <th scope="col">原因</th>
+                        <th scope="col">操作者</th>
+                        {member && <th scope="col">操作</th>}
+                      </tr>
+                    </thead>
+                    <tbody>{pageEntries.map((entry) => (
+                      <tr key={entry.id} id={`point-entry-${entry.id}`}>
+                        <td className="entry-time" data-label="時間">
+                          <time dateTime={entry.createdAt}>{ledgerTime.format(new Date(entry.createdAt))}</time>
+                          <span className="mobile-timezone">Asia/Taipei</span>
+                        </td>
+                        <td className="entry-amount" data-label="異動">
+                          <strong>{entry.amount.toLocaleString('zh-TW', { signDisplay: 'always' })}<span className="mobile-points-unit"> 點</span></strong>
+                        </td>
+                        <td className="entry-source" data-label="類型">
+                          {{ SEED: '種子點數', GRANT: '加點', EXCHANGE: '兌換', REVERSAL: '撤回加點' }[entry.source]}
+                          {(entry.source === 'GRANT' || entry.source === 'REVERSAL') && <details className="id-details">
+                            <summary>紀錄識別</summary>
+                            <p className="brand-id">紀錄 ID {entry.id}</p>
+                            {entry.source === 'REVERSAL' && <p className="brand-id">原加點紀錄 ID {originalIds.has(entry.reversalOfId)
+                              ? <a href={`#point-entry-${entry.reversalOfId}`}>{entry.reversalOfId}</a> : entry.reversalOfId}</p>}
+                          </details>}
+                        </td>
+                        <td data-label="原因">{entry.reason ?? '—'}</td>
+                        <td data-label="操作者">{entry.actorDisplayName}</td>
+                        {member && <td data-label="操作">{entry.source === 'GRANT' && !reversedIds.has(entry.id) && (
+                          <button className="secondary" type="button" disabled={busy || !canReverse || !!pendingReversal}
+                            onClick={(event) => {
+                              reversalTrigger.current = event.currentTarget;
+                              showFeedback('reversal');
+                              setReversalDraft({ grantId: entry.id, points: entry.amount, reason: '' });
+                              reversalReason.current?.focus();
+                            }}>選擇撤回</button>
+                        )}</td>}
+                      </tr>
+                    ))}</tbody>
+                  </table>
+                )}
+                <p className="page-count">本頁 {pageEntries.length} 筆</p>
+                {(ledger.page > 1 || ledger.data.hasNext) && (
+                  <nav className="brand-actions" aria-label="點數流水分頁">
+                    <button type="button" disabled={busy || ledger.page === 1}
+                      onClick={() => browse(ledger.page - 1)}>上一頁</button>
+                    <p role="status">第 {ledger.page} 頁</p>
+                    <button type="button" disabled={busy || !ledger.data.hasNext}
+                      onClick={() => browse(ledger.page + 1)}>下一頁</button>
+                  </nav>
+                )}
+              </>
+            )}
+            {!isMember && <p className="hint ledger-note">人工加點紀錄可整筆撤回，原紀錄保留。</p>}
+          </section>
+        )}
+
+      </div>
     </section>
   );
 }

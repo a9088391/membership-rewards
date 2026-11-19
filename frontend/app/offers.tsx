@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { RefreshIcon } from './icons';
 import { useExchange } from './exchange';
 import { apiRequest, errorNotice, isResourceId, NoticeBox, type Notice } from './request';
 
 const statusLabels = {
   UPCOMING: '尚未開始',
-  ACTIVE: '進行中',
-  EXPIRED: '已到期',
+  ACTIVE: '可兌換',
+  EXPIRED: '已結束',
   STOPPED: '已停發',
 } as const;
 
@@ -14,7 +15,7 @@ const taipeiTime = new Intl.DateTimeFormat('zh-TW', {
   hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3, hourCycle: 'h23',
 });
 
-type Offer = {
+type OfferDto = {
   id: string;
   name: string;
   description: string;
@@ -25,10 +26,10 @@ type Offer = {
   status: keyof typeof statusLabels;
 };
 
-type OfferPage = { items: Offer[]; hasNext: boolean };
+type OfferPageDto = { items: OfferDto[]; hasNext: boolean };
 const emptyDraft = { name: '', description: '', points: '', startsAt: '', endsAt: '' };
 type Draft = typeof emptyDraft;
-type StopTarget = Pick<Offer, 'id' | 'name'>;
+type StopTarget = Pick<OfferDto, 'id' | 'name'>;
 type Review = { kind: 'create' } | { kind: 'stop'; offer: StopTarget };
 type Feedback = { notice: Notice; review?: Review };
 type ReadStart = { revision: number; page: number; error?: Notice };
@@ -37,19 +38,19 @@ function isTime(value: unknown): value is string {
   return typeof value === 'string' && Number.isFinite(Date.parse(value));
 }
 
-function isOffer(value: unknown): value is Offer {
+function isOfferDto(value: unknown): value is OfferDto {
   if (!value || typeof value !== 'object') return false;
-  const { id, name, description, points, startsAt, endsAt, stoppedAt, status } = value as Partial<Offer>;
+  const { id, name, description, points, startsAt, endsAt, stoppedAt, status } = value as Partial<OfferDto>;
   return isResourceId(id) && typeof name === 'string' && typeof description === 'string'
     && typeof points === 'number' && Number.isInteger(points) && points > 0
     && isTime(startsAt) && isTime(endsAt) && (stoppedAt === null || isTime(stoppedAt))
     && typeof status === 'string' && Object.hasOwn(statusLabels, status);
 }
 
-function isOfferPage(value: unknown): value is OfferPage {
+function isOfferPageDto(value: unknown): value is OfferPageDto {
   return !!value && typeof value === 'object'
     && 'hasNext' in value && typeof value.hasNext === 'boolean'
-    && 'items' in value && Array.isArray(value.items) && value.items.every(isOffer);
+    && 'items' in value && Array.isArray(value.items) && value.items.every(isOfferDto);
 }
 
 type Access = {
@@ -101,7 +102,8 @@ export function Offers({ brand, active, memberNumber, actor, sessionInterrupted,
         setFeedback({ notice: { kind: 'alert', message: '兌換點數須為 1 至 2,147,483,647 的整數。' } });
         return;
       }
-      input = { ...draft, points };
+      // 選取值一律視為台北時刻，明確附加時區，避免依裝置時區轉換。
+      input = { ...draft, points, startsAt: `${draft.startsAt}+08:00`, endsAt: `${draft.endsAt}+08:00` };
     }
 
     const controller = new AbortController();
@@ -116,7 +118,7 @@ export function Offers({ brand, active, memberNumber, actor, sessionInterrupted,
     writeRequest.current = null;
     setSaving(false);
 
-    if (result.status === (offer ? 200 : 201) && isOffer(result.body)
+    if (result.status === (offer ? 200 : 201) && isOfferDto(result.body)
       && (!offer || (result.body.id === offer.id && result.body.status === 'STOPPED'))) {
       if (!offer) setDraft(emptyDraft);
       setFeedback({ notice: {
@@ -139,7 +141,7 @@ export function Offers({ brand, active, memberNumber, actor, sessionInterrupted,
       setFeedback({ notice: {
         ...failure,
         message: offer ? '無法停發方案。請重新讀取方案清單後再試。'
-          : '無法上架方案。請確認名稱、純文字優惠內容、整數點數及起訖時間。起訖須帶時區，且開始早於仍在未來的截止時間。',
+          : '無法上架方案。請確認名稱、純文字優惠內容、整數點數及台北起訖時間。開始須早於截止，截止須在未來。',
       } });
     } else {
       setFeedback({
@@ -194,7 +196,7 @@ function OfferList({
   const [initialPage] = useState(readStart.page);
   const [autoRead] = useState(!readStart.error && !feedback?.review);
   const [page, setPage] = useState(initialPage);
-  const [list, setList] = useState<OfferPage | null>(null);
+  const [list, setList] = useState<OfferPageDto | null>(null);
   const [readError, setReadError] = useState<Notice | undefined>(readStart.error);
   const [checkedFirstPage, setCheckedFirstPage] = useState(false);
   const [loading, setLoading] = useState(autoRead);
@@ -223,7 +225,7 @@ function OfferList({
     if (sessionInterrupted()) return;
     setPage(target);
 
-    if (result.status === 200 && isOfferPage(result.body)) {
+    if (result.status === 200 && isOfferPageDto(result.body)) {
       setList(result.body);
       if (target === 1) setCheckedFirstPage(true);
       clearReadError();
@@ -262,7 +264,7 @@ function OfferList({
 
   return (
     <>
-      <p className="hint">方案時間以 Asia/Taipei 顯示。</p>
+      <p className="hint">方案及持有券共用有效期間，到期不退點。時間以 Asia/Taipei 顯示。</p>
       {feedback && !saving && <NoticeBox notice={feedback.notice} />}
       {exchange.notice && <NoticeBox notice={exchange.notice} />}
       {exchange.sending && <p role="status">送出兌換中…</p>}
@@ -274,7 +276,7 @@ function OfferList({
       {readError && <NoticeBox notice={readError} />}
       <div className="brand-actions">
         <button type="button" aria-disabled={busy}
-          onClick={() => browse(review?.kind === 'create' ? 1 : page)}>重新讀取方案清單</button>
+          onClick={() => browse(review?.kind === 'create' ? 1 : page)}><RefreshIcon />重新讀取方案清單</button>
         {canManage && review && reviewed && (
           <button type="button" aria-disabled={busy} onClick={() => {
             if (busy || request.current || sessionInterrupted()) return;
@@ -296,38 +298,42 @@ function OfferList({
           {list.items.length ? (
             <ul className="brand-list offers-list">
               {list.items.map((offer) => (
-                <li key={offer.id}>
-                  <h4>{offer.name}</h4>
-                  <p>{offer.description}</p>
-                  <dl>
-                    <div><dt>狀態</dt><dd>{statusLabels[offer.status]}</dd></div>
-                    <div><dt>兌換點數</dt><dd>{offer.points.toLocaleString('zh-TW')}</dd></div>
-                    <div><dt>開始時間</dt><dd><time dateTime={offer.startsAt}>{taipeiTime.format(new Date(offer.startsAt))}</time></dd></div>
-                    <div><dt>截止時間</dt><dd><time dateTime={offer.endsAt}>{taipeiTime.format(new Date(offer.endsAt))}</time></dd></div>
-                  </dl>
-                  {memberNumber && offer.status === 'ACTIVE' && (
-                    <button type="button" aria-disabled={busy || !exchange.canExchange}
-                      aria-label={`兌換：${offer.name}（${offer.points.toLocaleString('zh-TW')} 點，方案 ID ${offer.id}）`}
-                      onClick={() => {
-                        if (!busy && exchange.canExchange) void exchange.send(offer.id);
-                      }}>兌換</button>
-                  )}
-                  {canManage && (
-                    <>
-                      <p className="brand-id">方案 ID {offer.id}</p>
-                      {offer.status !== 'STOPPED' && (
-                        <button type="button" aria-disabled={locked} aria-describedby="offer-stop-hint"
-                          aria-label={`停發：${offer.name}（方案 ID ${offer.id}）`}
-                          onClick={() => {
-                            if (!locked && !request.current) void save(page, offer);
-                          }}>停發</button>
-                      )}
-                    </>
-                  )}
+                <li className="ticket" key={offer.id}>
+                  <div className="ticket-main">
+                    <div className="ticket-heading"><h4>{offer.name}</h4><span className={`status-badge status-${offer.status.toLowerCase()}`}>{statusLabels[offer.status]}</span></div>
+                    <p>{offer.description}</p>
+                    <dl>
+                      <div><dt>開始時間</dt><dd><time dateTime={offer.startsAt}>{taipeiTime.format(new Date(offer.startsAt))}</time></dd></div>
+                      <div><dt>截止時間</dt><dd><time dateTime={offer.endsAt}>{taipeiTime.format(new Date(offer.endsAt))}</time></dd></div>
+                    </dl>
+                    <details className="id-details"><summary>方案識別資訊</summary><p className="brand-id">方案 ID {offer.id}</p></details>
+                  </div>
+                  <div className="ticket-action">
+                    <p className="ticket-points"><strong>{offer.points.toLocaleString('zh-TW')}</strong> 點</p>
+                    {memberNumber && offer.status === 'ACTIVE' && (
+                      <button type="button" aria-disabled={busy || !exchange.canExchange}
+                        aria-label={`兌換：${offer.name}（${offer.points.toLocaleString('zh-TW')} 點，方案 ID ${offer.id}）`}
+                        onClick={() => {
+                          if (!busy && exchange.canExchange) void exchange.send(offer.id);
+                        }}>兌換</button>
+                    )}
+                    {canManage && (
+                      <>
+                        {offer.status !== 'STOPPED' && (
+                          <button type="button" aria-disabled={locked} aria-describedby="offer-stop-hint"
+                            aria-label={`停發：${offer.name}（方案 ID ${offer.id}）`}
+                            onClick={() => {
+                              if (!locked && !request.current) void save(page, offer);
+                            }}>停發</button>
+                        )}
+                      </>
+                    )}
+                  </div>
                 </li>
               ))}
             </ul>
           ) : <p>此頁沒有優惠券方案。</p>}
+          <p className="page-count">本頁 {list.items.length} 筆</p>
           {(page > 1 || list.hasNext) && (
             <nav className="brand-actions" aria-label="優惠券方案分頁">
               <button type="button" disabled={page === 1} aria-disabled={busy} onClick={() => browse(page - 1)}>上一頁</button>
@@ -338,33 +344,35 @@ function OfferList({
         </>
       )}
       {canManage && (
-        <form className="brand-form" aria-labelledby="offer-create-title" method="post" onSubmit={create}>
-          <h4 id="offer-create-title">建立優惠券方案</h4>
-          <label htmlFor="offer-name">方案名稱</label>
-          <input id="offer-name" name="name" value={draft.name} readOnly={locked} required
-            onChange={(event) => setDraft({ ...draft, name: event.target.value })} aria-describedby="offer-name-hint" />
-          <p className="hint" id="offer-name-hint">去除首尾空白後 1 至 80 個字元。</p>
-          <label htmlFor="offer-description">優惠內容</label>
-          <textarea id="offer-description" name="description" value={draft.description} readOnly={locked} required rows={3}
-            onChange={(event) => setDraft({ ...draft, description: event.target.value })} aria-describedby="offer-description-hint" />
-          <p className="hint" id="offer-description-hint">純文字，去除首尾空白後 1 至 500 個字元。</p>
-          <label htmlFor="offer-points">兌換點數</label>
-          <input id="offer-points" name="points" inputMode="numeric" value={draft.points} readOnly={locked} required
-            onChange={(event) => setDraft({ ...draft, points: event.target.value })} aria-describedby="offer-points-hint" />
-          <p className="hint" id="offer-points-hint">1 至 2,147,483,647 的整數。</p>
-          <label htmlFor="offer-starts-at">開始時間</label>
-          <input id="offer-starts-at" name="startsAt" value={draft.startsAt} readOnly={locked} required spellCheck={false}
-            onChange={(event) => setDraft({ ...draft, startsAt: event.target.value })} aria-describedby="offer-time-hint" />
-          <label htmlFor="offer-ends-at">截止時間</label>
-          <input id="offer-ends-at" name="endsAt" value={draft.endsAt} readOnly={locked} required spellCheck={false}
-            onChange={(event) => setDraft({ ...draft, endsAt: event.target.value })} aria-describedby="offer-time-hint" />
-          <p className="hint" id="offer-time-hint">
-            ISO 8601 須帶時區。Asia/Taipei 格式範例 <code>2027-01-02T15:04:05.123+08:00</code>。
-            開始須早於截止，截止須在未來。
-          </p>
-          <p className="hint">建立即上架。上架後方案條件固定。</p>
-          <button type="submit" aria-disabled={locked}>上架方案</button>
-        </form>
+        <details className="create-offer">
+          <summary>建立優惠券方案</summary>
+          <form className="brand-form" aria-labelledby="offer-create-title" method="post" onSubmit={create}>
+            <h4 id="offer-create-title">建立優惠券方案</h4>
+            <label htmlFor="offer-name">方案名稱</label>
+            <input id="offer-name" name="name" value={draft.name} readOnly={locked} required
+              onChange={(event) => setDraft({ ...draft, name: event.target.value })} aria-describedby="offer-name-hint" />
+            <p className="hint" id="offer-name-hint">去除首尾空白後 1 至 80 個字元。</p>
+            <label htmlFor="offer-description">優惠內容</label>
+            <textarea id="offer-description" name="description" value={draft.description} readOnly={locked} required rows={3}
+              onChange={(event) => setDraft({ ...draft, description: event.target.value })} aria-describedby="offer-description-hint" />
+            <p className="hint" id="offer-description-hint">純文字，去除首尾空白後 1 至 500 個字元。</p>
+            <label htmlFor="offer-points">兌換點數</label>
+            <input id="offer-points" name="points" inputMode="numeric" value={draft.points} readOnly={locked} required
+              onChange={(event) => setDraft({ ...draft, points: event.target.value })} aria-describedby="offer-points-hint" />
+            <p className="hint" id="offer-points-hint">1 至 2,147,483,647 的整數。</p>
+            <label htmlFor="offer-starts-at">開始時間</label>
+            <input id="offer-starts-at" name="startsAt" type="datetime-local" value={draft.startsAt} disabled={locked} required
+              onChange={(event) => setDraft({ ...draft, startsAt: event.target.value })} aria-describedby="offer-time-hint" />
+            <label htmlFor="offer-ends-at">截止時間</label>
+            <input id="offer-ends-at" name="endsAt" type="datetime-local" value={draft.endsAt} disabled={locked} required
+              onChange={(event) => setDraft({ ...draft, endsAt: event.target.value })} aria-describedby="offer-time-hint" />
+            <p className="hint" id="offer-time-hint">
+              以台北時間（Asia/Taipei，UTC+08:00）選擇日期與時間。開始須早於截止，截止須在未來。
+            </p>
+            <p className="hint">建立即上架。上架後方案條件固定。</p>
+            <button type="submit" aria-disabled={locked}>上架方案</button>
+          </form>
+        </details>
       )}
     </>
   );
